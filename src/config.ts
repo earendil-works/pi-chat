@@ -7,6 +7,8 @@ import type {
 	ChatAccountConfig,
 	ChatConfig,
 	ConfiguredChannel,
+	GondolinConfig,
+	GondolinSecretConfig,
 	ResolvedConversation,
 } from "./core/config-types.js";
 
@@ -20,14 +22,6 @@ function sanitizePathSegment(value: string): string {
 
 function getAccountStorageDir(accountId: string): string {
 	return join(CHAT_HOME, "accounts", sanitizePathSegment(accountId));
-}
-
-function getWorkspaceAccountStorageDir(accountId: string, cwd: string): string {
-	return join(cwd, ".pi-chat", "accounts", sanitizePathSegment(accountId));
-}
-
-function getWorkspaceChannelStorageDir(accountId: string, channelKey: string, cwd: string): string {
-	return join(getWorkspaceAccountStorageDir(accountId, cwd), "channels", sanitizePathSegment(channelKey));
 }
 
 function getChannelStorageDir(accountId: string, channelKey: string): string {
@@ -46,6 +40,16 @@ function mergeAccess(...policies: Array<AccessPolicy | undefined>): AccessPolicy
 	return merged;
 }
 
+function mergeGondolinSecrets(...configs: Array<GondolinConfig | undefined>): Record<string, GondolinSecretConfig> {
+	const merged: Record<string, GondolinSecretConfig> = {};
+	for (const config of configs) {
+		for (const [name, secret] of Object.entries(config?.secrets ?? {})) {
+			merged[name] = { value: secret.value, hosts: [...secret.hosts] };
+		}
+	}
+	return merged;
+}
+
 function buildResolvedConversation(
 	config: ChatConfig,
 	accountId: string,
@@ -54,10 +58,9 @@ function buildResolvedConversation(
 ): ResolvedConversation {
 	const account = config.accounts[accountId];
 	if (!account) throw new Error(`Unknown account: ${accountId}`);
-	const accountDir = sanitizePathSegment(accountId);
-	const channelDir = sanitizePathSegment(channelKey);
-	const conversationDir = join(CHAT_HOME, "accounts", accountDir, "channels", channelDir);
-	const workspaceFilesDir = join(process.cwd(), ".pi-chat", "accounts", accountDir, "channels", channelDir);
+	const accountDir = getAccountStorageDir(accountId);
+	const conversationDir = getChannelStorageDir(accountId, channelKey);
+	const workspaceDir = join(conversationDir, "workspace");
 	return {
 		service: account.service,
 		botName: config.botName?.trim() || "pi",
@@ -68,8 +71,16 @@ function buildResolvedConversation(
 		conversationId: `${accountId}/${channelKey}`,
 		conversationName: `${account.name ?? accountId} / ${channel.name ?? channelKey}`,
 		access: mergeAccess(account.access, channel.access),
+		gondolinSecrets: mergeGondolinSecrets(config.gondolin, account.gondolin, channel.gondolin),
+		accountDir,
+		sharedDir: join(accountDir, "shared"),
+		conversationDir,
+		workspaceDir,
+		gondolinDir: join(conversationDir, "gondolin"),
+		accountMemoryPath: join(accountDir, "shared", "memory.md"),
+		channelMemoryPath: join(conversationDir, "workspace", "memory.md"),
 		logPath: join(conversationDir, "channel.jsonl"),
-		filesDir: join(workspaceFilesDir, "files"),
+		filesDir: join(workspaceDir, "incoming"),
 		lockPath: join(conversationDir, ".lock"),
 	};
 }
@@ -79,15 +90,13 @@ export async function ensureChatHome(): Promise<void> {
 	await mkdir(CHAT_CACHE_DIR, { recursive: true });
 }
 
-export async function removeAccountStorage(accountId: string, cwd: string): Promise<void> {
+export async function removeAccountStorage(accountId: string, _cwd: string): Promise<void> {
 	await rm(getAccountStorageDir(accountId), { recursive: true, force: true });
-	await rm(getWorkspaceAccountStorageDir(accountId, cwd), { recursive: true, force: true });
 	await rm(join(CHAT_CACHE_DIR, `${sanitizePathSegment(accountId)}.json`), { force: true });
 }
 
-export async function removeChannelStorage(accountId: string, channelKey: string, cwd: string): Promise<void> {
+export async function removeChannelStorage(accountId: string, channelKey: string, _cwd: string): Promise<void> {
 	await rm(getChannelStorageDir(accountId, channelKey), { recursive: true, force: true });
-	await rm(getWorkspaceChannelStorageDir(accountId, channelKey, cwd), { recursive: true, force: true });
 }
 
 export async function saveChatConfig(config: ChatConfig): Promise<void> {
@@ -102,6 +111,7 @@ export async function loadChatConfig(): Promise<ChatConfig> {
 		const parsed = JSON.parse(content) as ChatConfig;
 		return {
 			botName: parsed.botName?.trim() || "pi",
+			gondolin: parsed.gondolin,
 			accounts: (parsed.accounts ?? {}) as Record<string, ChatAccountConfig>,
 		};
 	} catch {

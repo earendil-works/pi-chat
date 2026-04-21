@@ -103,7 +103,10 @@ async function sendDiscordMessage(
 	content: string,
 	attachmentPaths: string[] = [],
 	signal?: AbortSignal,
+	replyToMessageId?: string,
 ): Promise<string> {
+	const payload: Record<string, unknown> = { content };
+	if (replyToMessageId) payload.message_reference = { message_id: replyToMessageId };
 	if (attachmentPaths.length === 0) {
 		const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
 			method: "POST",
@@ -111,7 +114,7 @@ async function sendDiscordMessage(
 				Authorization: `Bot ${botToken}`,
 				"content-type": "application/json",
 			},
-			body: JSON.stringify({ content }),
+			body: JSON.stringify(payload),
 			signal,
 		});
 		const data = (await response.json()) as { id?: string; message?: string };
@@ -119,7 +122,7 @@ async function sendDiscordMessage(
 		return data.id;
 	}
 	const form = new FormData();
-	form.set("payload_json", JSON.stringify({ content }));
+	form.set("payload_json", JSON.stringify(payload));
 	for (const [index, path] of attachmentPaths.entries()) {
 		const file = await readLocalAttachment(path);
 		form.set(`files[${index}]`, new Blob([Buffer.from(file.data)], { type: file.mimeType }), file.name);
@@ -161,10 +164,8 @@ export async function connectDiscordLive(
 	await catchUp(client, conversation, account, handlers, lastMessageId);
 	await handlers.onCaughtUp();
 	const preview = new StreamingPreview(conversation.service, {
-		create: async (text) => {
-			const channel = await resolveTextChannel(client, conversation);
-			const sent = await channel.send({ content: text });
-			return sent.id;
+		create: async (text, _parseMode, replyToMessageId) => {
+			return sendDiscordMessage(account.botToken, conversation.channel.id, text, [], undefined, replyToMessageId);
 		},
 		edit: async (id, text) => {
 			const channel = await resolveTextChannel(client, conversation);
@@ -193,13 +194,11 @@ export async function connectDiscordLive(
 			client.off(Events.MessageCreate, onMessageCreate);
 			client.destroy();
 		},
-		sendImmediate: async (text) => {
-			const channel = await resolveTextChannel(client, conversation);
-			const sent = await channel.send({ content: text });
-			return sent.id;
+		sendImmediate: async (text, replyToMessageId) => {
+			return sendDiscordMessage(account.botToken, conversation.channel.id, text, [], undefined, replyToMessageId);
 		},
-		sendFinal: async (text, attachmentPaths = [], signal) =>
-			sendDiscordMessage(account.botToken, conversation.channel.id, text, attachmentPaths, signal),
+		sendFinal: async (text, attachmentPaths = [], signal, replyToMessageId) =>
+			sendDiscordMessage(account.botToken, conversation.channel.id, text, attachmentPaths, signal, replyToMessageId),
 		startTyping: async () => {
 			const channel = await resolveTextChannel(client, conversation);
 			await channel.sendTyping();
@@ -207,5 +206,6 @@ export async function connectDiscordLive(
 		stopTyping: async () => {},
 		syncPreview: async (markdown, done = false) => preview.update(markdown, done),
 		clearPreview: async () => preview.clear(),
+		setReplyTo: (messageId) => preview.setReplyTo(messageId),
 	};
 }

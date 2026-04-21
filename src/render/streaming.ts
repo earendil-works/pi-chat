@@ -15,7 +15,7 @@ export interface PreviewChunk {
 }
 
 export interface PreviewTransport {
-	create(text: string, parseMode?: "Markdown"): Promise<string>;
+	create(text: string, parseMode?: "Markdown", replyToMessageId?: string): Promise<string>;
 	edit(id: string, text: string, parseMode?: "Markdown"): Promise<void>;
 	delete(id: string): Promise<void>;
 }
@@ -26,10 +26,15 @@ export class StreamingPreview {
 	private renderer = new StreamingMarkdownRenderer();
 	private rawText = "";
 	private chunks: PreviewChunk[] = [];
+	private replyToMessageId: string | undefined;
 
 	constructor(service: ChatService, transport: PreviewTransport) {
 		this.service = service;
 		this.transport = transport;
+	}
+
+	setReplyTo(messageId: string | undefined): void {
+		this.replyToMessageId = messageId;
 	}
 
 	reset(): void {
@@ -66,7 +71,8 @@ export class StreamingPreview {
 			const text = parts[index] || " ";
 			const existing = this.chunks[index];
 			if (!existing) {
-				const id = await this.transport.create(text, rendered.parseMode);
+				const replyTo = this.chunks.length === 0 ? this.replyToMessageId : undefined;
+				const id = await this.transport.create(text, rendered.parseMode, replyTo);
 				this.chunks.push({ id, text });
 				continue;
 			}

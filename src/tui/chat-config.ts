@@ -12,6 +12,8 @@ import type {
 	ChatAccountConfig,
 	ChatConfig,
 	DiscordAccountConfig,
+	GondolinConfig,
+	GondolinSecretConfig,
 	TelegramAccountConfig,
 } from "../core/config-types.js";
 import type { DiscoveredChannel, DiscoveredRole, DiscoveredUser, DiscoverySnapshot } from "../core/discovery-types.js";
@@ -61,6 +63,101 @@ function toRoleToggleItems(
 
 function defaultAccess(dm: boolean): AccessPolicy {
 	return { trigger: dm ? "message" : "mention", ignoreBots: true };
+}
+
+function secretSummary(config: GondolinConfig | undefined): string {
+	const count = Object.keys(config?.secrets ?? {}).length;
+	return `${count} secret${count === 1 ? "" : "s"}`;
+}
+
+function isValidEnvVarName(value: string): boolean {
+	return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
+}
+
+async function promptSecretDraft(
+	ctx: ExtensionContext,
+	name?: string,
+	current?: GondolinSecretConfig,
+): Promise<{ name: string; secret: GondolinSecretConfig } | undefined> {
+	const secretName = (await ctx.ui.input("VM env var name", name ?? "GITHUB_TOKEN"))?.trim();
+	if (!secretName) return undefined;
+	if (!isValidEnvVarName(secretName)) {
+		await showNotice(ctx, "Invalid secret", "VM env var name must look like GITHUB_TOKEN.", "error");
+		return undefined;
+	}
+	const valueLabel = current ? "Secret value (leave empty to keep current)" : "Secret value";
+	const inputValue = (await ctx.ui.input(valueLabel, "")) ?? "";
+	const secretValue = inputValue.length > 0 ? inputValue : current?.value;
+	if (!secretValue) return undefined;
+	const hostsRaw = (
+		await ctx.ui.input("Allowed hosts (comma separated)", (current?.hosts ?? ["api.github.com"]).join(", "))
+	)?.trim();
+	if (!hostsRaw) return undefined;
+	const hosts = hostsRaw
+		.split(",")
+		.map((value) => value.trim())
+		.filter(Boolean);
+	if (hosts.length === 0) {
+		await showNotice(ctx, "Invalid secret", "At least one host is required.", "error");
+		return undefined;
+	}
+	return { name: secretName, secret: { value: secretValue, hosts } };
+}
+
+async function configureSecrets(
+	ctx: ExtensionContext,
+	title: string,
+	config: GondolinConfig | undefined,
+	onSave: (next: GondolinConfig | undefined) => Promise<void>,
+): Promise<void> {
+	let current: GondolinConfig = { secrets: { ...(config?.secrets ?? {}) } };
+	while (true) {
+		const secrets = current.secrets ?? {};
+		const choice = await selectItem(ctx, title, [
+			{ value: "__add__", label: "+ Add secret", description: "Expose a placeholder env var inside Gondolin" },
+			...Object.entries(secrets)
+				.sort(([a], [b]) => a.localeCompare(b))
+				.map(([name, secret]) => ({
+					value: name,
+					label: name,
+					description: secret.hosts.join(", "),
+				})),
+			{ value: "__save__", label: "Save" },
+			{ value: "__back__", label: "Back" },
+		]);
+		if (!choice || choice === "__back__") return;
+		if (choice === "__save__") {
+			const next = Object.keys(current.secrets ?? {}).length > 0 ? current : undefined;
+			await onSave(next);
+			return;
+		}
+		if (choice === "__add__") {
+			const draft = await promptSecretDraft(ctx);
+			if (!draft) continue;
+			current = { ...current, secrets: { ...(current.secrets ?? {}), [draft.name]: draft.secret } };
+			continue;
+		}
+		const existing = current.secrets?.[choice];
+		if (!existing) continue;
+		const action = await selectItem(ctx, choice, [
+			{ value: "edit", label: "Edit" },
+			{ value: "delete", label: "Delete" },
+			{ value: "back", label: "Back" },
+		]);
+		if (!action || action === "back") continue;
+		if (action === "delete") {
+			const nextSecrets = { ...(current.secrets ?? {}) };
+			delete nextSecrets[choice];
+			current = { ...current, secrets: nextSecrets };
+			continue;
+		}
+		const draft = await promptSecretDraft(ctx, choice, existing);
+		if (!draft) continue;
+		const nextSecrets = { ...(current.secrets ?? {}) };
+		if (draft.name !== choice) delete nextSecrets[choice];
+		nextSecrets[draft.name] = draft.secret;
+		current = { ...current, secrets: nextSecrets };
+	}
 }
 
 async function promptAccessPolicy(
@@ -167,6 +264,7 @@ async function configureConfiguredChannel(
 	while (true) {
 		const choice = await selectItem(ctx, `${accountId}/${channelKey}`, [
 			{ value: "access", label: "Edit access policy" },
+			{ value: "secrets", label: "Secrets", description: secretSummary(channel.gondolin) },
 			{ value: "delete", label: "Delete channel", description: "Remove this configured channel" },
 			{ value: "back", label: "Back" },
 		]);
@@ -183,6 +281,14 @@ async function configureConfiguredChannel(
 			account.channels[channelKey] = channel;
 			await saveChatConfig(config);
 			await showNotice(ctx, "Channel updated", `Updated ${accountId}/${channelKey}`, "info");
+			continue;
+		}
+		if (choice === "secrets") {
+			await configureSecrets(ctx, `${accountId}/${channelKey} secrets`, channel.gondolin, async (next) => {
+				channel.gondolin = next;
+				account.channels[channelKey] = channel;
+				await saveChatConfig(config);
+			});
 			continue;
 		}
 		if (choice === "delete") {
@@ -216,6 +322,7 @@ async function configureDiscordAccount(ctx: ExtensionContext, accountId: string)
 				return aConfigured - bConfigured || a.label.localeCompare(b.label);
 			});
 		const choice = await selectItem(ctx, `${accountId} (${account.serverName})`, [
+			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
 			{ value: "delete", label: "Delete account", description: "Remove account and all configured channels" },
 			{
 				value: "refresh",
@@ -226,6 +333,14 @@ async function configureDiscordAccount(ctx: ExtensionContext, accountId: string)
 			{ value: "back", label: "Back" },
 		]);
 		if (!choice || choice === "back") return;
+		if (choice === "secrets") {
+			await configureSecrets(ctx, `${accountId} secrets`, account.gondolin, async (next) => {
+				account.gondolin = next;
+				config.accounts[accountId] = account;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
 		if (choice === "delete") {
 			const ok = await ctx.ui.confirm("Delete account", `Delete ${accountId} and all configured channels?`);
 			if (!ok) continue;
@@ -260,6 +375,7 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 			description: `${channel.name ?? channel.id}${channel.dm ? " • dm" : " • group"}`,
 		}));
 		const choice = await selectItem(ctx, `${accountId} (@${account.botUsername ?? "bot"})`, [
+			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
 			{ value: "add-dm", label: "Add DM", description: "Pair a DM by sending /start to the bot" },
 			{ value: "add-group", label: "Add group", description: "Observe activity after adding the bot to a group" },
 			{ value: "refresh", label: "Refresh bot info" },
@@ -268,6 +384,14 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 			{ value: "back", label: "Back" },
 		]);
 		if (!choice || choice === "back") return;
+		if (choice === "secrets") {
+			await configureSecrets(ctx, `${accountId} secrets`, account.gondolin, async (next) => {
+				account.gondolin = next;
+				config.accounts[accountId] = account;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
 		if (choice === "add-dm") {
 			await addTelegramObservedTargetToAccount(ctx, config, accountId, account, "dm");
 			continue;
@@ -316,6 +440,7 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 				.map(async (accountId) => ({ accountId, snapshot: await loadDiscoverySnapshot(accountId) })),
 		);
 		const choice = await selectItem(ctx, "pi-chat accounts", [
+			{ value: "__secrets__", label: "Secrets", description: secretSummary(config.gondolin) },
 			...snapshots.map(({ accountId, snapshot }) => ({
 				value: accountId,
 				label: accountId,
@@ -324,6 +449,13 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 			{ value: "__create__", label: "+ Create account", description: "Create a Telegram or Discord account" },
 		]);
 		if (!choice) return;
+		if (choice === "__secrets__") {
+			await configureSecrets(ctx, "pi-chat secrets", config.gondolin, async (next) => {
+				config.gondolin = next;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
 		if (choice === "__create__") {
 			const serviceChoice = await selectItem(ctx, "Create account", [
 				{ value: "telegram", label: "Telegram" },

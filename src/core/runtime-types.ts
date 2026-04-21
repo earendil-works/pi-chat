@@ -107,6 +107,7 @@ export interface PendingJob {
 export interface DispatchableJob {
 	job: PendingJob;
 	prompt: string;
+	triggerMessageId?: string;
 }
 
 export interface ChatHistoryQuery {

@@ -15,10 +15,16 @@ export interface ResumeState {
 export interface LiveConnection {
 	conversation: ResolvedConversation;
 	disconnect(): Promise<void>;
-	sendImmediate(text: string): Promise<string | undefined>;
-	sendFinal(text: string, attachmentPaths?: string[], signal?: AbortSignal): Promise<string | undefined>;
+	sendImmediate(text: string, replyToMessageId?: string): Promise<string | undefined>;
+	sendFinal(
+		text: string,
+		attachmentPaths?: string[],
+		signal?: AbortSignal,
+		replyToMessageId?: string,
+	): Promise<string | undefined>;
 	startTyping(status?: string): Promise<void>;
 	stopTyping(): Promise<void>;
 	syncPreview(markdown: string, done?: boolean): Promise<string[]>;
 	clearPreview(): Promise<void>;
+	setReplyTo(messageId: string | undefined): void;
 }

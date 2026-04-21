@@ -27,13 +27,27 @@ function isDMConversation(conversation: ResolvedConversation): boolean {
 	return conversation.channel.dm ?? false;
 }
 
-function formatTranscriptRecord(record: ChatLogRecord): string[] {
+function toGuestDisplayPath(conversation: ResolvedConversation, localPath: string): string {
+	if (localPath === conversation.workspaceDir || localPath.startsWith(`${conversation.workspaceDir}/`)) {
+		const suffix = localPath.slice(conversation.workspaceDir.length).replace(/^\//, "");
+		return suffix ? `/workspace/${suffix}` : "/workspace";
+	}
+	if (localPath === conversation.sharedDir || localPath.startsWith(`${conversation.sharedDir}/`)) {
+		const suffix = localPath.slice(conversation.sharedDir.length).replace(/^\//, "");
+		return suffix ? `/shared/${suffix}` : "/shared";
+	}
+	return localPath;
+}
+
+function formatTranscriptRecord(conversation: ResolvedConversation, record: ChatLogRecord): string[] {
 	if (record.type !== "inbound") return [];
 	const lines = [`- [${record.timestamp}] ${record.userName ?? record.userId}: ${record.text || "(no text)"}`];
 	if (record.attachments.length > 0) {
 		lines.push("  attachments:");
 		for (const attachment of record.attachments)
-			lines.push(`  - ${attachment.localPath}${attachment.mimeType ? ` (${attachment.mimeType})` : ""}`);
+			lines.push(
+				`  - ${toGuestDisplayPath(conversation, attachment.localPath)}${attachment.mimeType ? ` (${attachment.mimeType})` : ""}`,
+			);
 	}
 	return lines;
 }
@@ -42,6 +56,10 @@ function getLatestTriggerRecord(records: ChatLogRecord[], job: PendingJob): Inbo
 	const triggerRecord = records.find((record) => record.recordId === job.triggerRecordId);
 	if (!triggerRecord || triggerRecord.type !== "inbound") return undefined;
 	return triggerRecord;
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export class ConversationRuntime {
@@ -106,15 +124,42 @@ export class ConversationRuntime {
 		return last;
 	}
 
-	private isAllowedMessage(message: InboundMessageRecord): boolean {
+	private isAllowedInput(message: Pick<InboundMessageInput, "userId" | "roleIds" | "isBot">): boolean {
 		const access = this.conversation.access;
-		if (message.isBot && (access.ignoreBots ?? true)) return false;
+		if ((message.isBot ?? false) && (access.ignoreBots ?? true)) return false;
 		if (access.allowedUserIds?.length && !access.allowedUserIds.includes(message.userId)) return false;
 		if (access.allowedRoleIds?.length) {
 			const roleIds = message.roleIds ?? [];
 			if (!roleIds.some((roleId) => access.allowedRoleIds?.includes(roleId))) return false;
 		}
 		return true;
+	}
+
+	private isAllowedMessage(message: InboundMessageRecord): boolean {
+		return this.isAllowedInput(message);
+	}
+
+	parseControlCommand(input: InboundMessageInput): "stop" | "new" | "compact" | "status" | undefined {
+		const normalized = normalizeInboundMessage(input, this.conversation.botName);
+		if (!this.isAllowedInput(normalized)) return undefined;
+		const account = this.conversation.account;
+		let text = normalized.text;
+		const botUserId = "botUserId" in account ? account.botUserId : undefined;
+		if (botUserId) text = text.replace(new RegExp(`<@!?${escapeRegExp(botUserId)}>`, "g"), " ");
+		const aliases = [this.conversation.botName, "botUsername" in account ? account.botUsername : undefined].filter(
+			Boolean,
+		);
+		for (const alias of aliases) text = text.replace(new RegExp(`@${escapeRegExp(alias || "")}\\b`, "ig"), " ");
+		const command = text.replace(/\s+/g, " ").trim().toLowerCase();
+		if (command === "stop" || command === "/stop") return "stop";
+		if (command === "new" || command === "/new") return "new";
+		if (command === "compact" || command === "/compact") return "compact";
+		if (command === "status" || command === "/status") return "status";
+		return undefined;
+	}
+
+	matchesStopCommand(input: InboundMessageInput): boolean {
+		return this.parseControlCommand(input) === "stop";
 	}
 
 	private shouldTriggerJob(message: InboundMessageRecord): false | "mention" | "dm" {
@@ -194,7 +239,8 @@ export class ConversationRuntime {
 		const job = this.pendingJobs.shift();
 		if (!job) return undefined;
 		this.activeJob = job;
-		return { job, prompt: this.buildPrompt(job) };
+		const triggerRecord = getLatestTriggerRecord(this.records, job);
+		return { job, prompt: this.buildPrompt(job), triggerMessageId: triggerRecord?.messageId };
 	}
 
 	private buildPrompt(job: PendingJob): string {
@@ -204,7 +250,7 @@ export class ConversationRuntime {
 				record.recordId > completedBoundary && record.recordId <= job.triggerRecordId && record.type === "inbound",
 		);
 		const lines: string[] = [];
-		for (const record of slice) lines.push(...formatTranscriptRecord(record));
+		for (const record of slice) lines.push(...formatTranscriptRecord(this.conversation, record));
 		return lines.join("\n").trim();
 	}
 

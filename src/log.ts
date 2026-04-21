@@ -1,5 +1,5 @@
-import { appendFile, copyFile, mkdir, open, readFile, stat, unlink } from "node:fs/promises";
-import { basename, dirname, extname, join } from "node:path";
+import { appendFile, copyFile, lstat, mkdir, open, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
 
 import type {
 	AttachmentInput,
@@ -38,10 +38,34 @@ function sanitizeFileName(value: string): string {
 	return value.replace(/[^a-zA-Z0-9._-]+/g, "_");
 }
 
+async function ensureRegularFile(path: string): Promise<void> {
+	try {
+		const info = await lstat(path);
+		if (!info.isSymbolicLink()) return;
+		const content = await readFile(path, "utf8").catch(() => "");
+		await unlink(path);
+		await writeFile(path, content, "utf8");
+	} catch {
+		await writeFile(path, "", { flag: "a" });
+	}
+}
+
+function isInside(root: string, value: string): boolean {
+	const rel = relative(resolve(root), resolve(value));
+	return rel === "" || (!rel.startsWith("..") && !rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`));
+}
+
 export async function ensureConversationDirs(conversation: ResolvedConversation): Promise<void> {
+	await mkdir(conversation.accountDir, { recursive: true });
+	await mkdir(conversation.sharedDir, { recursive: true });
+	await mkdir(conversation.conversationDir, { recursive: true });
 	await mkdir(dirname(conversation.logPath), { recursive: true });
 	await mkdir(dirname(conversation.lockPath), { recursive: true });
+	await mkdir(conversation.workspaceDir, { recursive: true });
+	await mkdir(conversation.gondolinDir, { recursive: true });
 	await mkdir(conversation.filesDir, { recursive: true });
+	await ensureRegularFile(conversation.accountMemoryPath);
+	await ensureRegularFile(conversation.channelMemoryPath);
 }
 
 export async function readConversationLog(conversation: ResolvedConversation): Promise<ChatLogRecord[]> {
@@ -130,15 +154,17 @@ export async function materializeAttachments(
 		const fileStats = await stat(attachment.path);
 		if (!fileStats.isFile()) throw new Error(`Attachment is not a file: ${attachment.path}`);
 		const fileName = sanitizeFileName(attachment.name || basename(attachment.path));
-		const targetPath = join(conversation.filesDir, `${Date.now()}-${messageId}-${index + 1}-${fileName}`);
-		await copyFile(attachment.path, targetPath);
+		const targetPath = isInside(conversation.filesDir, attachment.path)
+			? attachment.path
+			: join(conversation.filesDir, `${Date.now()}-${messageId}-${index + 1}-${fileName}`);
+		if (targetPath !== attachment.path) await copyFile(attachment.path, targetPath);
 		stored.push({
 			kind: attachment.kind || guessAttachmentKind(attachment.path),
 			name: fileName,
 			mimeType: attachment.mimeType || guessMimeType(attachment.path),
 			size: fileStats.size,
 			remoteUrl: attachment.remoteUrl,
-			originalPath: attachment.path,
+			originalPath: targetPath === attachment.path ? undefined : attachment.path,
 			localPath: targetPath,
 		});
 	}

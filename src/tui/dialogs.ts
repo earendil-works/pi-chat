@@ -1,6 +1,15 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { BorderedLoader, DynamicBorder, getSettingsListTheme } from "@mariozechner/pi-coding-agent";
-import { Container, type SelectItem, SelectList, type SettingItem, SettingsList, Text } from "@mariozechner/pi-tui";
+import {
+	Container,
+	Key,
+	matchesKey,
+	type SelectItem,
+	SelectList,
+	type SettingItem,
+	SettingsList,
+	Text,
+} from "@mariozechner/pi-tui";
 
 export async function selectItem(
 	ctx: ExtensionContext,
@@ -55,7 +64,7 @@ export async function showNotice(
 			render: (width: number) => container.render(width),
 			invalidate: () => container.invalidate(),
 			handleInput: (data: string) => {
-				if (data === "\r" || data === "\n" || data === "\u001b") done(undefined);
+				if (matchesKey(data, Key.enter) || matchesKey(data, Key.escape) || matchesKey(data, "ctrl+c")) done(undefined);
 				tui.requestRender();
 			},
 		};

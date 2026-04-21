@@ -179,13 +179,14 @@ export async function connectTelegramLive(
 	let offset = resumeState?.cursor ? Number(resumeState.cursor) + 1 : 0;
 	const pollController = new AbortController();
 	const preview = new StreamingPreview(conversation.service, {
-		create: async (text, parseMode) =>
+		create: async (text, parseMode, replyToMessageId) =>
 			String(
 				(
 					await callTelegram<{ message_id: number }>(account.botToken, "sendMessage", {
 						chat_id: Number(conversation.channel.id),
 						text,
 						parse_mode: parseMode,
+						reply_to_message_id: replyToMessageId ? Number(replyToMessageId) : undefined,
 					})
 				).message_id,
 			),
@@ -313,16 +314,18 @@ export async function connectTelegramLive(
 			for (const state of mediaGroups.values()) if (state.timer) clearTimeout(state.timer);
 			await loop.catch(() => undefined);
 		},
-		sendImmediate: async (text) =>
+		sendImmediate: async (text, replyToMessageId) =>
 			String(
 				(
 					await callTelegram<{ message_id: number }>(account.botToken, "sendMessage", {
 						chat_id: Number(conversation.channel.id),
 						text,
+						reply_to_message_id: replyToMessageId ? Number(replyToMessageId) : undefined,
 					})
 				).message_id,
 			),
-		sendFinal: async (text, attachmentPaths = [], signal) => {
+		sendFinal: async (text, attachmentPaths = [], signal, replyToMessageId) => {
+			const replyParam = replyToMessageId ? { reply_to_message_id: Number(replyToMessageId) } : {};
 			if (attachmentPaths.length === 0) {
 				return String(
 					(
@@ -332,6 +335,7 @@ export async function connectTelegramLive(
 							{
 								chat_id: Number(conversation.channel.id),
 								text,
+								...replyParam,
 							},
 							{ signal },
 						)
@@ -345,6 +349,7 @@ export async function connectTelegramLive(
 			const firstField = firstKind === "image" ? "photo" : "document";
 			const firstForm = new FormData();
 			firstForm.set("chat_id", String(Number(conversation.channel.id)));
+			if (replyToMessageId) firstForm.set("reply_to_message_id", String(Number(replyToMessageId)));
 			if (text) firstForm.set("caption", text);
 			if (text && firstKind === "image") firstForm.set("parse_mode", "Markdown");
 			firstForm.set(firstField, new Blob([Buffer.from(first.data)], { type: first.mimeType }), first.name);
@@ -384,5 +389,6 @@ export async function connectTelegramLive(
 		stopTyping: async () => {},
 		syncPreview: async (markdown, done = false) => preview.update(markdown, done),
 		clearPreview: async () => preview.clear(),
+		setReplyTo: (messageId) => preview.setReplyTo(messageId),
 	};
 }
