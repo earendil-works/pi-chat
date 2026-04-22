@@ -1,5 +1,7 @@
 import type { ResolvedConversation, TelegramAccountConfig } from "../core/config-types.js";
 import type { InboundMessageInput } from "../core/runtime-types.js";
+import { chunkText } from "../render/chunking.js";
+import { formatMarkdownForService, maxMessageLength } from "../render/format.js";
 import { StreamingPreview } from "../render/streaming.js";
 import {
 	fetchBinary,
@@ -325,22 +327,30 @@ export async function connectTelegramLive(
 				).message_id,
 			),
 		send: async (text, attachmentPaths = [], signal, replyToMessageId) => {
+			const rendered = formatMarkdownForService("telegram", text);
 			const replyParam = replyToMessageId ? { reply_to_message_id: Number(replyToMessageId) } : {};
 			if (attachmentPaths.length === 0) {
-				return String(
-					(
-						await callTelegram<{ message_id: number }>(
-							account.botToken,
-							"sendMessage",
-							{
-								chat_id: Number(conversation.channel.id),
-								text,
-								...replyParam,
-							},
-							{ signal },
-						)
-					).message_id,
-				);
+				const chunks = chunkText(rendered.text, maxMessageLength("telegram"));
+				let firstId: string | undefined;
+				for (let i = 0; i < chunks.length; i++) {
+					const id = String(
+						(
+							await callTelegram<{ message_id: number }>(
+								account.botToken,
+								"sendMessage",
+								{
+									chat_id: Number(conversation.channel.id),
+									text: chunks[i],
+									parse_mode: rendered.parseMode,
+									...(i === 0 ? replyParam : {}),
+								},
+								{ signal },
+							)
+						).message_id,
+					);
+					firstId ??= id;
+				}
+				return firstId || "";
 			}
 			const [firstPath, ...rest] = attachmentPaths;
 			const first = await readLocalAttachment(firstPath);

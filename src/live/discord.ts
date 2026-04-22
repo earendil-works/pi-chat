@@ -6,6 +6,8 @@ import { Client, Events, GatewayIntentBits, type Message, Partials } from "disco
 
 import type { DiscordAccountConfig, ResolvedConversation } from "../core/config-types.js";
 import type { InboundMessageInput } from "../core/runtime-types.js";
+import { chunkText } from "../render/chunking.js";
+import { formatMarkdownForService, maxMessageLength } from "../render/format.js";
 import { StreamingPreview } from "../render/streaming.js";
 import { readLocalAttachment, storeDownloadedAttachment, textMentionsBot } from "./common.js";
 import type { LiveConnection, LiveConnectionHandlers } from "./types.js";
@@ -97,6 +99,23 @@ async function messageToInput(
 	};
 }
 
+async function postDiscordMessage(
+	botToken: string,
+	channelId: string,
+	payload: Record<string, unknown>,
+	signal?: AbortSignal,
+): Promise<string> {
+	const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+		method: "POST",
+		headers: { Authorization: `Bot ${botToken}`, "content-type": "application/json" },
+		body: JSON.stringify(payload),
+		signal,
+	});
+	const data = (await response.json()) as { id?: string; message?: string };
+	if (!response.ok || !data.id) throw new Error(data.message || "Discord send failed");
+	return data.id;
+}
+
 async function sendDiscordMessage(
 	botToken: string,
 	channelId: string,
@@ -105,37 +124,35 @@ async function sendDiscordMessage(
 	signal?: AbortSignal,
 	replyToMessageId?: string,
 ): Promise<string> {
-	const payload: Record<string, unknown> = { content };
-	if (replyToMessageId) payload.message_reference = { message_id: replyToMessageId };
-	if (attachmentPaths.length === 0) {
-		const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
-			method: "POST",
-			headers: {
-				Authorization: `Bot ${botToken}`,
-				"content-type": "application/json",
-			},
-			body: JSON.stringify(payload),
-			signal,
-		});
-		const data = (await response.json()) as { id?: string; message?: string };
-		if (!response.ok || !data.id) throw new Error(data.message || "Discord send failed");
-		return data.id;
+	const rendered = formatMarkdownForService("discord", content);
+	const limit = maxMessageLength("discord");
+	const chunks = chunkText(rendered.text, limit);
+	let firstMessageId: string | undefined;
+	for (let i = 0; i < chunks.length; i++) {
+		const payload: Record<string, unknown> = { content: chunks[i] };
+		if (i === 0 && replyToMessageId) payload.message_reference = { message_id: replyToMessageId };
+		if (i === chunks.length - 1 && attachmentPaths.length > 0) {
+			const form = new FormData();
+			form.set("payload_json", JSON.stringify(payload));
+			for (const [index, path] of attachmentPaths.entries()) {
+				const file = await readLocalAttachment(path);
+				form.set(`files[${index}]`, new Blob([Buffer.from(file.data)], { type: file.mimeType }), file.name);
+			}
+			const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+				method: "POST",
+				headers: { Authorization: `Bot ${botToken}` },
+				body: form,
+				signal,
+			});
+			const data = (await response.json()) as { id?: string; message?: string };
+			if (!response.ok || !data.id) throw new Error(data.message || "Discord send failed");
+			firstMessageId ??= data.id;
+		} else {
+			const id = await postDiscordMessage(botToken, channelId, payload, signal);
+			firstMessageId ??= id;
+		}
 	}
-	const form = new FormData();
-	form.set("payload_json", JSON.stringify(payload));
-	for (const [index, path] of attachmentPaths.entries()) {
-		const file = await readLocalAttachment(path);
-		form.set(`files[${index}]`, new Blob([Buffer.from(file.data)], { type: file.mimeType }), file.name);
-	}
-	const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
-		method: "POST",
-		headers: { Authorization: `Bot ${botToken}` },
-		body: form,
-		signal,
-	});
-	const data = (await response.json()) as { id?: string; message?: string };
-	if (!response.ok || !data.id) throw new Error(data.message || "Discord attachment send failed");
-	return data.id;
+	return firstMessageId || "";
 }
 
 async function catchUp(
