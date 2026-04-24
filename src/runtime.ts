@@ -41,7 +41,9 @@ function toGuestDisplayPath(conversation: ResolvedConversation, localPath: strin
 
 function formatTranscriptRecord(conversation: ResolvedConversation, record: ChatLogRecord): string[] {
 	if (record.type !== "inbound") return [];
-	const lines = [`- [${record.timestamp}] ${record.userName ?? record.userId}: ${record.text || "(no text)"}`];
+	const lines = [
+		`- [${record.timestamp}] [uid:${record.userId}] ${record.userName ?? "unknown"}: ${record.text || "(no text)"}`,
+	];
 	if (record.attachments.length > 0) {
 		lines.push("  attachments:");
 		for (const attachment of record.attachments)
@@ -139,7 +141,7 @@ export class ConversationRuntime {
 		return this.isAllowedInput(message);
 	}
 
-	parseControlCommand(input: InboundMessageInput): "stop" | "new" | "compact" | "status" | undefined {
+	parseControlCommand(input: InboundMessageInput): "stop" | "new" | "compact" | "status" | "restart" | undefined {
 		const normalized = normalizeInboundMessage(input, this.conversation.botName);
 		if (!this.isAllowedInput(normalized)) return undefined;
 		const account = this.conversation.account;
@@ -155,7 +157,26 @@ export class ConversationRuntime {
 		if (command === "new" || command === "/new") return "new";
 		if (command === "compact" || command === "/compact") return "compact";
 		if (command === "status" || command === "/status") return "status";
+		if (command === "restart" || command === "/restart" || command === "reload" || command === "/reload")
+			return "restart";
 		return undefined;
+	}
+
+	parseModelCommand(input: InboundMessageInput): string | undefined {
+		const normalized = normalizeInboundMessage(input, this.conversation.botName);
+		if (!this.isAllowedInput(normalized)) return undefined;
+		const account = this.conversation.account;
+		let text = normalized.text;
+		const botUserId = "botUserId" in account ? account.botUserId : undefined;
+		if (botUserId) text = text.replace(new RegExp(`<@!?${escapeRegExp(botUserId)}>`, "g"), " ");
+		const aliases = [this.conversation.botName, "botUsername" in account ? account.botUsername : undefined].filter(
+			Boolean,
+		);
+		for (const alias of aliases) text = text.replace(new RegExp(`@${escapeRegExp(alias || "")}\\b`, "ig"), " ");
+		const trimmed = text.replace(/\s+/g, " ").trim();
+		const match = trimmed.match(/^\/?(model)\s+(.+)$/i);
+		if (!match) return undefined;
+		return match[2].trim();
 	}
 
 	matchesStopCommand(input: InboundMessageInput): boolean {
@@ -240,7 +261,7 @@ export class ConversationRuntime {
 		if (!job) return undefined;
 		this.activeJob = job;
 		const triggerRecord = getLatestTriggerRecord(this.records, job);
-		return { job, prompt: this.buildPrompt(job), triggerMessageId: triggerRecord?.messageId };
+		return { job, prompt: this.buildPrompt(job), triggerMessageId: triggerRecord?.messageId, triggerUserId: triggerRecord?.userId };
 	}
 
 	private buildPrompt(job: PendingJob): string {

@@ -12,7 +12,7 @@ import type {
 	ResolvedConversation,
 } from "./core/config-types.js";
 
-export const CHAT_HOME = join(homedir(), ".pi", "agent", "chat");
+export const CHAT_HOME = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "chat");
 export const CHAT_CONFIG_PATH = join(CHAT_HOME, "config.json");
 export const CHAT_CACHE_DIR = join(CHAT_HOME, "cache");
 

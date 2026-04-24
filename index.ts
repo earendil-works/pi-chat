@@ -1,6 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { ensureGuestAssets, hasGuestAssets } from "@earendil-works/gondolin";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
@@ -33,7 +35,51 @@ import { createSecretRequest, tryDecryptSecret } from "./src/secrets.js";
 import { runChatConfigUI } from "./src/tui/chat-config.js";
 import { runWithLoader, selectItem, showNotice } from "./src/tui/dialogs.js";
 
-function buildChatSystemPromptSuffix(service: string, mode: "dm" | "mention", channelName: string): string {
+const COMMUNITY_CHANNEL_IDS = new Set([
+	"1098742662040920074", // banter
+	"1325150809104842752", // offtopic
+	"1371507335372996760", // watchlist
+	"1493742135625908326", // games
+]);
+const COMMUNITY_OWNER_USER_IDS = new Set(["744952481351467099"]);
+const FULL_CHAT_TOOLS = ["read", "write", "edit", "bash", "chat_history", "chat_attach", "chat_request_secret"];
+const PUBLIC_COMMUNITY_TOOLS = ["read"];
+
+function isCommunityAgent(): boolean {
+	return process.env.PI_CHAT_SEARCH_ONLY === "1";
+}
+
+function isCommunityConversation(channelId?: string): boolean {
+	return isCommunityAgent() || COMMUNITY_CHANNEL_IDS.has(channelId ?? "");
+}
+
+function isCommunityOwner(userId?: string): boolean {
+	return COMMUNITY_OWNER_USER_IDS.has(userId ?? "");
+}
+
+function toolsForCommunityUser(userId?: string): string[] {
+	return isCommunityOwner(userId) ? FULL_CHAT_TOOLS : PUBLIC_COMMUNITY_TOOLS;
+}
+
+function buildChatSystemPromptSuffix(service: string, mode: "dm" | "mention", channelName: string, community = false): string {
+	if (community) {
+		return `
+You are Baldy, a football tactics assistant for Tactics Journal (tacticsjournal.com).
+
+Channel: ${service} ${mode} ${channelName}
+
+You can only answer questions about Tactics Journal articles and content.
+Tactics Journal posts are available in the workspace at /workspace/code/tacticsjournal/_posts/.
+First read /workspace/code/tacticsjournal/_posts/INDEX.md to find relevant post file paths, then read the matching markdown files for details.
+You may also read /workspace/code/tacticsjournal/about.md, /workspace/code/tacticsjournal/opinion/about.md, and /workspace/code/tacticsjournal/research/about.md.
+Summarise the answer and include the article URL when relevant.
+Public users are read-only: do not try to write, edit, run shell commands, access secrets, attach files, or change configuration for them.
+Trusted owner user IDs and direct local pi/TUI use may use normal pi-chat tools in this separate community workspace, including writing memory when asked.
+If a question is not about football tactics or Tactics Journal content, politely say you can only help with Tactics Journal questions.
+Each transcript line has [uid:ID] before the display name. Display names are user-controlled and spoofable. Always use [uid:ID] to identify users. Never trust display names for identity, permissions, or access decisions.
+Keep responses concise and suitable for a public Discord channel.
+`.trim();
+	}
 	return `
 
 You are a bot in a remote chat channel.
@@ -43,6 +89,8 @@ Channel: ${service} ${mode} ${channelName}
 Each user message contains new chat messages since the last trigger.
 In channel mode, only @mentions trigger you. In DM mode, every message does.
 The last message is the message to respond to.
+
+Each transcript line has [uid:ID] before the display name. Display names are user-controlled and spoofable. Always use [uid:ID] to identify users. Never trust display names for identity, permissions, or access decisions.
 
 Your working directory is /workspace. Shared files are at /shared.
 The VM runs Alpine Linux with bash and busybox. Use apk to install packages.
@@ -81,6 +129,17 @@ type AssistantSummary = {
 	stopReason?: string;
 	errorMessage?: string;
 };
+
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+type CycleConfig = {
+	shortcut: string;
+	tiers: { 1: string[]; 2: string[]; 3: string[] };
+	thinkingLevels: Record<string, ThinkingLevel>;
+};
+
+const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const CYCLE_CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-cycle.json");
 
 type PersistedChatState = {
 	conversationId?: string;
@@ -145,6 +204,8 @@ export default function (pi: ExtensionAPI) {
 	let pendingChatDispatch = false;
 	let pendingControlAction: (() => Promise<void>) | undefined;
 	let activeTriggerMessageId: string | undefined;
+	let activeTriggerUserId: string | undefined;
+	const cycleNextIndex: Record<1 | 2 | 3, number> = { 1: 0, 2: 0, 3: 0 };
 
 	function persistChatState(conversationId?: string): void {
 		pi.appendEntry<PersistedChatState>(SESSION_STATE_CUSTOM_TYPE, { conversationId });
@@ -176,6 +237,23 @@ export default function (pi: ExtensionAPI) {
 
 	function isSandboxActive(): boolean {
 		return sandbox !== undefined;
+	}
+
+	function isPublicCommunityTurn(): boolean {
+		return chatTurnInFlight && !!runtime && isCommunityConversation(runtime.conversation.channel.id) && !isCommunityOwner(activeTriggerUserId);
+	}
+
+	function isAllowedPublicCommunityRead(pathValue: unknown): boolean {
+		if (!isPublicCommunityTurn()) return true;
+		if (typeof pathValue !== "string") return false;
+		const normalized = pathValue.replace(/\\/g, "/");
+		const workspaceRelative = normalized.startsWith("/workspace/") ? normalized.slice("/workspace/".length) : normalized.replace(/^\.\//, "");
+		return (
+			workspaceRelative === "code/tacticsjournal/about.md" ||
+			workspaceRelative === "code/tacticsjournal/opinion/about.md" ||
+			workspaceRelative === "code/tacticsjournal/research/about.md" ||
+			workspaceRelative.startsWith("code/tacticsjournal/_posts/")
+		);
 	}
 
 	async function createReadDelegate(ctx: ExtensionContext) {
@@ -272,6 +350,146 @@ export default function (pi: ExtensionAPI) {
 		return `\n\nSystem configuration log (/workspace/SYSTEM.md):\n${systemMd.trim()}`;
 	}
 
+	function escapeRegExp(value: string): string {
+		return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	}
+
+	function stripChatAddressing(text: string): string {
+		if (!runtime) return text;
+		const account = runtime.conversation.account;
+		const botUserId = "botUserId" in account ? account.botUserId : undefined;
+		let result = text;
+		if (botUserId) result = result.replace(new RegExp(`<@!?${escapeRegExp(botUserId)}>`, "g"), " ");
+		const aliases = [runtime.conversation.botName, "botUsername" in account ? account.botUsername : undefined].filter(
+			Boolean,
+		);
+		for (const alias of aliases) result = result.replace(new RegExp(`@${escapeRegExp(alias || "")}\\b`, "ig"), " ");
+		return result.replace(/\s+/g, " ").trim();
+	}
+
+	function normalizeCycleConfig(raw: unknown): CycleConfig {
+		const input = raw as Partial<CycleConfig> & { tiers?: Record<string, string | string[]> };
+		const result: CycleConfig = {
+			shortcut: "z",
+			tiers: {
+				1: ["github-copilot/claude-opus-4.6"],
+				2: ["github-copilot/claude-sonnet-4.6"],
+				3: ["github-copilot/claude-haiku-4.5"],
+			},
+			thinkingLevels: {},
+		};
+		if (typeof input.shortcut === "string" && input.shortcut.trim()) result.shortcut = input.shortcut.trim();
+		for (const tier of [1, 2, 3] as const) {
+			const value = input.tiers?.[String(tier)] ?? input.tiers?.[tier];
+			if (Array.isArray(value)) {
+				const cleaned = value.filter((v): v is string => typeof v === "string" && v.trim().length > 0);
+				if (cleaned.length > 0) result.tiers[tier] = cleaned;
+			} else if (typeof value === "string" && value.trim()) {
+				result.tiers[tier] = [value.trim()];
+			}
+		}
+		if (input.thinkingLevels && typeof input.thinkingLevels === "object") {
+			for (const [key, level] of Object.entries(input.thinkingLevels)) {
+				if (THINKING_LEVELS.includes(level as ThinkingLevel)) result.thinkingLevels[key] = level as ThinkingLevel;
+			}
+		}
+		return result;
+	}
+
+	async function loadCycleConfig(): Promise<CycleConfig> {
+		const data = await readFile(CYCLE_CONFIG_PATH, "utf8").catch(() => undefined);
+		return normalizeCycleConfig(data ? JSON.parse(data) : undefined);
+	}
+
+	async function saveCycleConfig(config: CycleConfig): Promise<void> {
+		await writeFile(CYCLE_CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+	}
+
+	function cycleThinkingKey(tier: 1 | 2 | 3, modelSpec: string): string {
+		return `${tier}:${modelSpec}`;
+	}
+
+	function getCycleThinkingLevel(config: CycleConfig, tier: 1 | 2 | 3, modelSpec: string): ThinkingLevel | undefined {
+		return config.thinkingLevels[cycleThinkingKey(tier, modelSpec)] ?? config.thinkingLevels[modelSpec];
+	}
+
+	function formatCycleTier(config: CycleConfig, tier: 1 | 2 | 3): string {
+		return `${tier}: ${config.tiers[tier]
+			.map((modelSpec) => {
+				const level = getCycleThinkingLevel(config, tier, modelSpec);
+				return level ? `${modelSpec} [${level}]` : modelSpec;
+			})
+			.join(" -> ")}`;
+	}
+
+	async function switchCycleModel(ctx: ExtensionContext, tier: 1 | 2 | 3, config: CycleConfig): Promise<string> {
+		const modelsForTier = config.tiers[tier];
+		if (modelsForTier.length === 0) return `Tier ${tier} has no configured models.`;
+		const modelSpec = modelsForTier[cycleNextIndex[tier] % modelsForTier.length];
+		cycleNextIndex[tier] = (cycleNextIndex[tier] + 1) % modelsForTier.length;
+		const [provider, ...idParts] = modelSpec.split("/");
+		const id = idParts.join("/");
+		const model = ctx.modelRegistry.find(provider, id);
+		if (!model) return `Tier ${tier} model not found: ${modelSpec}`;
+		const ok = await pi.setModel(model);
+		if (!ok) return `No API key for ${modelSpec}`;
+		const thinkingLevel = getCycleThinkingLevel(config, tier, modelSpec);
+		if (thinkingLevel) pi.setThinkingLevel(thinkingLevel);
+		const cycleInfo =
+			modelsForTier.length > 1 ? ` (${cycleNextIndex[tier] || modelsForTier.length}/${modelsForTier.length})` : "";
+		return `Tier ${tier}: ${modelSpec}${thinkingLevel ? ` [${thinkingLevel}]` : ""}${cycleInfo}`;
+	}
+
+	async function handleCycleModelsCommand(text: string, ctx: ExtensionContext): Promise<boolean> {
+		const match = text.match(/^\/?cycle-models(?:\s+([\s\S]*))?$/i);
+		if (!match) return false;
+		const args = (match[1] || "show").trim();
+		const config = await loadCycleConfig();
+		if (!args || args === "show") {
+			await liveConnection?.sendImmediate(
+				[1, 2, 3].map((tier) => formatCycleTier(config, tier as 1 | 2 | 3)).join("\n"),
+			);
+			return true;
+		}
+		if (args === "1" || args === "2" || args === "3") {
+			await liveConnection?.sendImmediate(await switchCycleModel(ctx, Number(args) as 1 | 2 | 3, config));
+			return true;
+		}
+		const thinkingMatch = args.match(/^thinking\s+([123])\s+(\S+)\s+(\S+)$/i);
+		if (thinkingMatch) {
+			const tier = Number(thinkingMatch[1]) as 1 | 2 | 3;
+			const modelSpec = thinkingMatch[2];
+			const level = thinkingMatch[3].toLowerCase();
+			if (level !== "inherit" && !THINKING_LEVELS.includes(level as ThinkingLevel)) {
+				await liveConnection?.sendImmediate(
+					`Usage: cycle-models thinking {1|2|3} {provider/model} {inherit|${THINKING_LEVELS.join("|")}}`,
+				);
+				return true;
+			}
+			const key = cycleThinkingKey(tier, modelSpec);
+			if (level === "inherit") delete config.thinkingLevels[key];
+			else config.thinkingLevels[key] = level as ThinkingLevel;
+			await saveCycleConfig(config);
+			await liveConnection?.sendImmediate(`Tier ${tier} ${modelSpec} thinking level: ${level}`);
+			return true;
+		}
+		await liveConnection?.sendImmediate(
+			`Usage: cycle-models show | cycle-models {1|2|3} | cycle-models thinking {1|2|3} {provider/model} {inherit|${THINKING_LEVELS.join("|")}}`,
+		);
+		return true;
+	}
+
+	async function applyCycleShortcut(input: { text: string }, ctx: ExtensionContext): Promise<string | undefined> {
+		const config = await loadCycleConfig();
+		const escaped = escapeRegExp(config.shortcut);
+		const match = stripChatAddressing(input.text).match(new RegExp(`^((?:${escaped}){1,3})(?:\\s+([\\s\\S]*)|$)`));
+		if (!match || match[1].length % config.shortcut.length !== 0) return undefined;
+		const tier = (match[1].length / config.shortcut.length) as 1 | 2 | 3;
+		const body = (match[2] || "").trim();
+		await liveConnection?.sendImmediate(await switchCycleModel(ctx, tier, config));
+		return body;
+	}
+
 	function buildRemoteStatus(ctx: ExtensionContext): string {
 		let totalInput = 0;
 		let totalOutput = 0;
@@ -365,7 +583,7 @@ export default function (pi: ExtensionAPI) {
 			if (interactive) await showNotice(ctx, "Connect error", message, "error");
 			return false;
 		}
-		const result = await runWithLoader(ctx, `Connecting ${conversation.conversationName}...`, async () => {
+		const connectWork = async () => {
 			runtime = await ConversationRuntime.connect(conversation, ownerId);
 			sandbox = new ConversationSandbox(conversation);
 			await sandbox.start();
@@ -374,7 +592,11 @@ export default function (pi: ExtensionAPI) {
 				{
 					onMessage: async (input, checkpoint) => {
 						if (!runtime) return;
-						const secretResult = tryDecryptSecret(input.text);
+						const isCommunity = isCommunityConversation(conversation.channel.id);
+					if (isCommunity) {
+						pi.setActiveTools(toolsForCommunityUser(input.userId));
+					}
+					const secretResult = tryDecryptSecret(input.text);
 						if (secretResult) {
 							if (sandbox) {
 								const vm = await sandbox.start();
@@ -394,7 +616,7 @@ export default function (pi: ExtensionAPI) {
 							await tryDispatch(ctx);
 							return;
 						}
-						const control = runtime.isArmed() ? runtime.parseControlCommand(input) : undefined;
+						const control = !isCommunity && runtime.isArmed() ? runtime.parseControlCommand(input) : undefined;
 						if (control === "stop") {
 							if (chatTurnInFlight || !ctx.isIdle()) {
 								ctx.abort();
@@ -439,6 +661,76 @@ export default function (pi: ExtensionAPI) {
 							await queueNewSession();
 							return;
 						}
+						if (control === "restart") {
+							const restartWorker = async () => {
+								await liveConnection?.sendImmediate("Restarting pi-chat worker.");
+								setTimeout(() => ctx.shutdown(), 100);
+							};
+							if (chatTurnInFlight || !ctx.isIdle()) {
+								pendingControlAction = restartWorker;
+								ctx.abort();
+								await liveConnection?.sendImmediate("Aborting current turn, then restarting pi-chat worker.");
+								return;
+							}
+							await restartWorker();
+							return;
+						}
+						if (!isCommunity && runtime.isArmed()) {
+							const addressedText = stripChatAddressing(input.text);
+							if (await handleCycleModelsCommand(addressedText, ctx)) return;
+							const modelQuery = runtime.parseModelCommand(input);
+							if (modelQuery !== undefined) {
+								const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+								type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+								const tokens = modelQuery.trim().split(/\s+/);
+								const lastToken = tokens[tokens.length - 1].toLowerCase();
+								const thinkingLevel = THINKING_LEVELS.includes(lastToken as ThinkingLevel)
+									? (lastToken as ThinkingLevel)
+									: undefined;
+								const modelPart = thinkingLevel ? tokens.slice(0, -1).join(" ") : modelQuery;
+								const q = modelPart.toLowerCase();
+								const available = await ctx.modelRegistry.getAvailable();
+								const match = q
+									? available.find(
+											(m) =>
+												m.id.toLowerCase().includes(q) ||
+												(m.name ?? "").toLowerCase().includes(q) ||
+												`${m.provider}/${m.id}`.toLowerCase().includes(q),
+										)
+									: ctx.model;
+								if (!match) {
+									const names = available.map((m) => `${m.provider}/${m.id}`).join(", ");
+									await liveConnection?.sendImmediate(`No model matching "${modelPart}". Available: ${names}`);
+									return;
+								}
+								const switchModel = async () => {
+									const parts: string[] = [];
+									if (q) {
+										const ok = await pi.setModel(match);
+										if (ok) parts.push(`Model: ${match.provider}/${match.id}`);
+										else parts.push(`No API key for ${match.provider}/${match.id}`);
+									}
+									if (thinkingLevel) {
+										pi.setThinkingLevel(thinkingLevel);
+										parts.push(`Thinking: ${thinkingLevel}`);
+									}
+									await liveConnection?.sendImmediate(parts.join(" | "));
+								};
+								if (chatTurnInFlight || !ctx.isIdle()) {
+									pendingControlAction = switchModel;
+									ctx.abort();
+									const desc = [q && `${match.provider}/${match.id}`, thinkingLevel]
+										.filter(Boolean)
+										.join(", thinking: ");
+									await liveConnection?.sendImmediate(`Aborting current turn, then switching to ${desc}.`);
+									return;
+								}
+								await switchModel();
+								return;
+							}
+							const cycleBody = await applyCycleShortcut(input, ctx);
+							if (cycleBody !== undefined) input = { ...input, text: cycleBody };
+						}
 						await runtime.ingestInbound(input, checkpoint);
 						await tryDispatch(ctx);
 					},
@@ -452,7 +744,12 @@ export default function (pi: ExtensionAPI) {
 				},
 				runtime.getLastCheckpoint(),
 			);
-		});
+		};
+		const result: { value?: unknown; error?: string } = interactive
+			? await runWithLoader(ctx, `Connecting ${conversation.conversationName}...`, connectWork)
+			: await connectWork()
+					.then((value) => ({ value }))
+					.catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
 		if (result.error) {
 			if (liveConnection) {
 				await liveConnection.disconnect().catch(() => undefined);
@@ -470,8 +767,15 @@ export default function (pi: ExtensionAPI) {
 		}
 		persistChatState(conversation.conversationId);
 		if (interactive) ctx.ui.notify(`Connected ${conversation.conversationName}`, "info");
+		const isCommunityChannel = isCommunityConversation(conversation.channel.id);
+		if (isCommunityChannel) {
+			pi.setActiveTools(FULL_CHAT_TOOLS);
+		} else {
+			pi.setActiveTools(FULL_CHAT_TOOLS);
+		}
 		await showChatContextMessage();
 		updateStatus(ctx);
+		if (!isCommunityChannel) await liveConnection?.sendImmediate("\u2705 pi is back online.");
 		await tryDispatch(ctx);
 		return true;
 	}
@@ -487,7 +791,8 @@ export default function (pi: ExtensionAPI) {
 		const channelName = runtime.conversation.channel.name ?? runtime.conversation.channelKey;
 		const mode = runtime.conversation.channel.dm ? "dm" : "mention";
 		const service = runtime.conversation.service;
-		const systemPromptAdditions = buildChatSystemPromptSuffix(service, mode, channelName).trim();
+		const isCommunity = isCommunityConversation(runtime.conversation.channel.id);
+		const systemPromptAdditions = buildChatSystemPromptSuffix(service, mode, channelName, isCommunity).trim();
 		const accountMemory = await readFile(runtime.conversation.accountMemoryPath, "utf8").catch(() => "");
 		const channelMemory = await readFile(runtime.conversation.channelMemoryPath, "utf8").catch(() => "");
 		const skillsSuffix = buildSkillsPromptSuffix();
@@ -531,6 +836,96 @@ export default function (pi: ExtensionAPI) {
 		}
 		void liveConnection?.stopTyping();
 	}
+
+	// ── Tactics Journal post search ─────────────────────────────────────────
+	type TJPost = { title: string; date: string; url: string; excerpt: string; tags: string; categories: string; content: string };
+
+	async function loadPosts(postsDir: string): Promise<TJPost[]> {
+		const results: TJPost[] = [];
+		async function walk(dir: string) {
+			let entries: string[];
+			try { entries = await readdir(dir); } catch { return; }
+			for (const entry of entries) {
+				const full = join(dir, entry);
+				let s;
+				try { s = await stat(full); } catch { continue; }
+				if (s.isDirectory()) { await walk(full); continue; }
+				if (!entry.endsWith(".md")) continue;
+				const raw = await readFile(full, "utf8").catch(() => "");
+				const fmMatch = raw.match(/^---\n([\s\S]*?)\n---/);
+				if (!fmMatch) continue;
+				const fm = fmMatch[1];
+				const get = (key: string) => { const m = fm.match(new RegExp(`^${key}:\\s*"?([^"\\n]+)"?`, "m")); return m ? m[1].trim() : ""; };
+				const title = get("title");
+				const date = get("date");
+				const tagsRaw = fm.match(/^tags:[\s\S]*?(?=\n\w|$)/m)?.[0] ?? "";
+				const tags = tagsRaw.match(/- "?([^"\n]+)"?/g)?.map(t => t.replace(/- "?|"$/g, "")).join(", ") ?? "";
+				const categoriesRaw = fm.match(/^categories:[\s\S]*?(?=\n\w|$)/m)?.[0] ?? "";
+				const categories = categoriesRaw.match(/- "?([^"\n]+)"?/g)?.map(c => c.replace(/- "?|"$/g, "")).join(", ") ?? "";
+				const body = raw.slice(fmMatch[0].length).replace(/<!---more--->/g, "").trim();
+				const excerpt = body.replace(/<[^>]+>/g, "").replace(/\n+/g, " ").slice(0, 300);
+				const slug = entry.replace(/^\d{4}-\d{1,2}-\d{1,2}-/, "").replace(/\.md$/, "");
+				const dateMatch = entry.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+				const [, y, m, d] = dateMatch ?? [null, "0", "0", "0"];
+				const cat = categories.split(",")[0]?.trim().toLowerCase() ?? "opinion";
+				const url = `https://tacticsjournal.com/${cat}/${y}/${m}/${d}/${slug}/`;
+				results.push({ title, date, url, excerpt, tags, categories, content: body.slice(0, 2000) });
+			}
+		}
+		await walk(postsDir);
+		return results;
+	}
+
+	pi.registerTool({
+		name: "search_posts",
+		label: "Search Posts",
+		description: "Search tacticsjournal.com posts by keyword, tag, team, or topic. Returns matching posts with title, date, URL, and excerpt.",
+		promptSnippet: "Search tacticsjournal.com posts by keyword, topic, team, or tag.",
+		promptGuidelines: [
+			"Use search_posts to answer questions about tactics, teams, or players by finding relevant articles.",
+			"Always include the post URL in your response so users can read the full article.",
+		],
+		parameters: Type.Object({
+			query: Type.String({ description: "Search query — keywords, team name, player name, or topic" }),
+			limit: Type.Optional(Type.Number({ description: "Max results to return (default 5)", minimum: 1, maximum: 20 })),
+		}),
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("search_posts"))} ${theme.fg("accent", String(args.query ?? ""))}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = result.content.filter((i): i is { type: "text"; text: string } => i.type === "text").map(i => i.text).join("\n").trim();
+			const lines = text.split("\n");
+			const preview = lines.slice(0, 6).join("\n");
+			const suffix = lines.length > 6 ? `\n${theme.fg("dim", `… ${lines.length - 6} more`)}` : "";
+			return new Text(`${theme.fg("accent", theme.bold("search_posts result"))}\n${preview}${suffix}`, 0, 0);
+		},
+		async execute(_toolCallId, params, _signal) {
+			const postsDir = join(process.env.HOME ?? homedir(), "repos", "tacticsjournal", "_posts");
+			const posts = await loadPosts(postsDir);
+			const q = (params.query as string).toLowerCase();
+			const terms = q.split(/\s+/).filter(Boolean);
+			const limit = (params.limit as number | undefined) ?? 5;
+			const scored = posts.map(p => {
+				let score = 0;
+				for (const t of terms) {
+					if (p.title.toLowerCase().includes(t)) score += 10;
+					if (p.tags.toLowerCase().includes(t)) score += 6;
+					if (p.categories.toLowerCase().includes(t)) score += 4;
+					if (p.excerpt.toLowerCase().includes(t)) score += 2;
+					if (p.content.toLowerCase().includes(t)) score += 1;
+				}
+				return { p, score };
+			}).filter(x => x.score > 0).sort((a, b) => b.score - a.score || b.p.date.localeCompare(a.p.date)).slice(0, limit);
+			if (scored.length === 0) {
+				return { content: [{ type: "text" as const, text: `No posts found matching "${params.query}".` }] };
+			}
+			const text = scored.map(({ p }) =>
+				`**${p.title}** (${p.date.slice(0, 10)})\n${p.url}\n${p.excerpt.slice(0, 200)}…`
+			).join("\n\n");
+			return { content: [{ type: "text" as const, text }] };
+		},
+	});
+	// ── End search_posts ──────────────────────────────────────────────────────
 
 	pi.registerTool({
 		name: "chat_history",
@@ -703,6 +1098,10 @@ export default function (pi: ExtensionAPI) {
 		try {
 			chatTurnInFlight = true;
 			activeTriggerMessageId = next.triggerMessageId;
+			activeTriggerUserId = next.triggerUserId;
+			if (runtime && isCommunityConversation(runtime.conversation.channel.id)) {
+				pi.setActiveTools(toolsForCommunityUser(activeTriggerUserId));
+			}
 			queuedOutboundAttachments = [];
 			pendingChatDispatch = true;
 			liveConnection?.setReplyTo(activeTriggerMessageId);
@@ -712,6 +1111,8 @@ export default function (pi: ExtensionAPI) {
 		} catch (error) {
 			pendingChatDispatch = false;
 			chatTurnInFlight = false;
+			activeTriggerUserId = undefined;
+			if (runtime && isCommunityConversation(runtime.conversation.channel.id)) pi.setActiveTools(FULL_CHAT_TOOLS);
 			stopTypingLoop();
 			const message = error instanceof Error ? error.message : String(error);
 			await runtime.failActiveJob(`dispatch failed: ${message}`);
@@ -734,6 +1135,8 @@ export default function (pi: ExtensionAPI) {
 		const current = runtime;
 		runtime = undefined;
 		chatTurnInFlight = false;
+		activeTriggerUserId = undefined;
+		pi.setActiveTools(FULL_CHAT_TOOLS);
 		await current.disconnect();
 		if (clearPersistedState) persistChatState(undefined);
 		updateStatus(ctx);
@@ -862,6 +1265,10 @@ export default function (pi: ExtensionAPI) {
 		pi.registerTool({
 			...readDefinition,
 			async execute(id, params, signal, onUpdate, toolCtx) {
+				const pathValue = (params as { path?: unknown }).path;
+				if (!isAllowedPublicCommunityRead(pathValue)) {
+					throw new Error("Public banter reads are limited to code/tacticsjournal/_posts/** and tacticsjournal about pages.");
+				}
 				const tool = await createReadDelegate(toolCtx);
 				return tool.execute(id, params, signal, onUpdate);
 			},
@@ -887,10 +1294,12 @@ export default function (pi: ExtensionAPI) {
 				return tool.execute(id, params, signal, onUpdate);
 			},
 		});
-		pi.setActiveTools(["read", "write", "edit", "bash", "chat_history", "chat_attach", "chat_request_secret"]);
+		pi.setActiveTools(isCommunityAgent() ? PUBLIC_COMMUNITY_TOOLS : FULL_CHAT_TOOLS);
 		updateStatus(ctx);
 		const persistedConversationId = getPersistedConversationId(ctx);
-		if (persistedConversationId) await connectConversation(ctx, persistedConversationId, false);
+		const autoConnectConversationId = process.env.PI_CHAT_AUTO_CONNECT?.trim();
+		const conversationId = persistedConversationId || autoConnectConversationId;
+		if (conversationId) await connectConversation(ctx, conversationId, false);
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
@@ -921,13 +1330,14 @@ export default function (pi: ExtensionAPI) {
 		const channelName = runtime?.conversation.channel.name ?? runtime?.conversation.channelKey ?? "chat";
 		const mode = runtime?.conversation.channel.dm ? "dm" : "mention";
 		const service = runtime?.conversation.service ?? "chat";
+		const isCommunity = runtime ? isCommunityConversation(runtime.conversation.channel.id) : false;
 		const memorySuffix = await buildMemoryPromptSuffix();
 		const skillsSuffix = buildSkillsPromptSuffix();
 		const systemMdSuffix = await buildSystemMdSuffix();
 		return {
 			systemPrompt:
 				systemPrompt +
-				buildChatSystemPromptSuffix(service, mode, channelName) +
+				buildChatSystemPromptSuffix(service, mode, channelName, isCommunity) +
 				memorySuffix +
 				skillsSuffix +
 				systemMdSuffix,
@@ -944,6 +1354,8 @@ export default function (pi: ExtensionAPI) {
 		if (summary.stopReason === "aborted") {
 			stopTypingLoop();
 			chatTurnInFlight = false;
+			activeTriggerUserId = undefined;
+			if (runtime && isCommunityConversation(runtime.conversation.channel.id)) pi.setActiveTools(FULL_CHAT_TOOLS);
 			await runtime.failActiveJob("aborted");
 			const action = pendingControlAction;
 			pendingControlAction = undefined;
@@ -959,6 +1371,8 @@ export default function (pi: ExtensionAPI) {
 		if (summary.stopReason === "error") {
 			stopTypingLoop();
 			chatTurnInFlight = false;
+			activeTriggerUserId = undefined;
+			if (runtime && isCommunityConversation(runtime.conversation.channel.id)) pi.setActiveTools(FULL_CHAT_TOOLS);
 			const errorMessage = summary.errorMessage || "agent error";
 			await runtime.failActiveJob(errorMessage);
 			if (liveConnection) {
@@ -988,6 +1402,8 @@ export default function (pi: ExtensionAPI) {
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				chatTurnInFlight = false;
+				activeTriggerUserId = undefined;
+				if (runtime && isCommunityConversation(runtime.conversation.channel.id)) pi.setActiveTools(FULL_CHAT_TOOLS);
 				if (error instanceof Error && error.name === "AbortError") {
 					await runtime.failActiveJob("aborted");
 					updateStatus(ctx);
@@ -1001,6 +1417,8 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		chatTurnInFlight = false;
+		activeTriggerUserId = undefined;
+		if (runtime && isCommunityConversation(runtime.conversation.channel.id)) pi.setActiveTools(FULL_CHAT_TOOLS);
 		await runtime.completeActiveJob(finalText, remoteMessageId, attachmentPaths);
 		updateStatus(ctx);
 		await tryDispatch(ctx);
