@@ -1,4 +1,6 @@
-import { access, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { access, copyFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { createHttpHooks, RealFSProvider, type SecretDefinition, VM } from "@earendil-works/gondolin";
@@ -48,7 +50,7 @@ async function walk(
 ): Promise<void> {
 	const entries = await readdir(current, { withFileTypes: true });
 	for (const entry of entries) {
-		if (entry.name === ".git" || entry.name === "node_modules") continue;
+		if (entry.name === ".git" || entry.name === "node_modules" || entry.isSymbolicLink()) continue;
 		const absolutePath = path.join(current, entry.name);
 		const relativePath = toPosix(path.relative(root, absolutePath));
 		const shouldDescend = await visit(absolutePath, relativePath);
@@ -111,9 +113,16 @@ export class ConversationSandbox {
 		return guestPath;
 	}
 
-	toAttachmentHostPath(inputPath: string): string {
-		const guestPath = this.resolveGuestPath(inputPath);
-		return this.guestToHostPath(guestPath);
+	async stageAttachment(inputPath: string): Promise<string> {
+		const sourcePath = this.guestToHostPath(inputPath);
+		const fileStats = await stat(sourcePath);
+		if (!fileStats.isFile()) throw new Error(`Not a file: ${inputPath}`);
+		const stagingDir = path.join(this.conversation.gondolinDir, "outgoing");
+		await mkdir(stagingDir, { recursive: true });
+		const safeName = path.basename(sourcePath).replace(/[^a-zA-Z0-9._-]+/g, "_") || "attachment";
+		const stagedPath = path.join(stagingDir, `${Date.now()}-${randomUUID()}-${safeName}`);
+		await copyFile(sourcePath, stagedPath);
+		return stagedPath;
 	}
 
 	resolveToolPath(inputPath: string): string {
@@ -123,15 +132,23 @@ export class ConversationSandbox {
 	guestToHostPath(inputPath: string): string {
 		const guestPath = this.resolveGuestPath(inputPath);
 		const mountRoot = guestMountRoot(guestPath);
+		let hostRoot: string;
+		let hostPath: string;
 		if (mountRoot === GONDOLIN_WORKSPACE) {
 			const relativePath = path.posix.relative(GONDOLIN_WORKSPACE, guestPath);
-			return path.join(this.conversation.workspaceDir, ...relativePath.split("/").filter(Boolean));
-		}
-		if (mountRoot === GONDOLIN_SHARED) {
+			hostRoot = this.conversation.workspaceDir;
+			hostPath = path.join(hostRoot, ...relativePath.split("/").filter(Boolean));
+		} else if (mountRoot === GONDOLIN_SHARED) {
 			const relativePath = path.posix.relative(GONDOLIN_SHARED, guestPath);
-			return path.join(this.conversation.sharedDir, ...relativePath.split("/").filter(Boolean));
+			hostRoot = this.conversation.sharedDir;
+			hostPath = path.join(hostRoot, ...relativePath.split("/").filter(Boolean));
+		} else {
+			throw new Error(`Path is outside mounted storage: ${inputPath}`);
 		}
-		throw new Error(`Path is outside mounted storage: ${inputPath}`);
+		const resolvedRoot = realpathSync(hostRoot);
+		const resolvedHostPath = realpathSync(hostPath);
+		if (!isInside(resolvedRoot, resolvedHostPath)) throw new Error(`Path is outside mounted storage: ${inputPath}`);
+		return resolvedHostPath;
 	}
 
 	hostToGuestPath(hostPath: string): string {

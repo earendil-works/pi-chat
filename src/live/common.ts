@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import type { ResolvedConversation } from "../core/config-types.js";
 import type { AttachmentInput } from "../core/runtime-types.js";
@@ -64,8 +64,8 @@ export function guessMimeType(fileName: string): string | undefined {
 export async function readLocalAttachment(
 	path: string,
 ): Promise<{ name: string; data: Uint8Array; mimeType?: string }> {
-	const fileStats = await stat(path);
-	if (!fileStats.isFile()) throw new Error(`Attachment is not a file: ${path}`);
+	const fileStats = await lstat(path);
+	if (!fileStats.isFile()) throw new Error(`Attachment is not a regular file: ${path}`);
 	return { name: basename(path), data: new Uint8Array(await readFile(path)), mimeType: guessMimeType(path) };
 }
 

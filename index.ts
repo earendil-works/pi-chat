@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ensureGuestAssets, hasGuestAssets } from "@earendil-works/gondolin";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -895,10 +895,7 @@ export default function (pi: ExtensionAPI) {
 			signal?.throwIfAborted?.();
 			for (const path of params.paths) {
 				signal?.throwIfAborted?.();
-				const resolvedPath = sandbox.toAttachmentHostPath(path);
-				const fileStats = await stat(resolvedPath);
-				if (!fileStats.isFile()) throw new Error(`Not a file: ${path}`);
-				queuedOutboundAttachments.push(resolvedPath);
+				queuedOutboundAttachments.push(await sandbox.stageAttachment(path));
 			}
 			return {
 				content: [{ type: "text", text: `Queued ${params.paths.length} attachment(s).` }],
