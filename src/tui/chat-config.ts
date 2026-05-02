@@ -309,12 +309,14 @@ async function configureDiscordAccount(ctx: ExtensionContext, accountId: string)
 		const account = config.accounts[accountId] as DiscordAccountConfig | undefined;
 		if (!account || account.service !== "discord") return;
 		const snapshot = await loadDiscoverySnapshot(accountId);
-		const configuredIds = new Set(Object.values(account.channels).map((channel) => channel.id));
+		const configuredChannelKeysById = new Map(
+			Object.entries(account.channels).map(([key, channel]) => [channel.id, key]),
+		);
 		const channelChoices = (snapshot?.channels ?? [])
 			.map((channel) => ({
 				value: channel.id,
-				label: `${configuredIds.has(channel.id) ? "●" : "○"} ${channel.name}`,
-				description: configuredIds.has(channel.id) ? "configured" : undefined,
+				label: `${configuredChannelKeysById.has(channel.id) ? "●" : "○"} ${channel.name}`,
+				description: configuredChannelKeysById.has(channel.id) ? "configured" : undefined,
 			}))
 			.sort((a, b) => {
 				const aConfigured = a.label.startsWith("●") ? 0 : 1;
@@ -360,7 +362,11 @@ async function configureDiscordAccount(ctx: ExtensionContext, accountId: string)
 			continue;
 		}
 		const selectedChannel = snapshot?.channels.find((channel) => channel.id === choice);
-		if (selectedChannel) await configureDiscoveredChannel(ctx, config, accountId, selectedChannel, snapshot);
+		if (selectedChannel) {
+			const configuredKey = configuredChannelKeysById.get(selectedChannel.id);
+			if (configuredKey) await configureConfiguredChannel(ctx, config, accountId, configuredKey);
+			else await configureDiscoveredChannel(ctx, config, accountId, selectedChannel, snapshot);
+		}
 	}
 }
 
