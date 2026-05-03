@@ -1,5 +1,5 @@
 import type { ResolvedConversation } from "../core/config-types.js";
-import type { InboundMessageInput } from "../core/runtime-types.js";
+import type { InboundMessageInput, OutboundAttachment } from "../core/runtime-types.js";
 
 export interface LiveConnectionHandlers {
 	onMessage(input: InboundMessageInput, checkpoint?: { cursor?: string; messageId?: string }): Promise<void>;
@@ -19,7 +19,7 @@ export interface LiveConnection {
 	sendImmediate(text: string, replyToMessageId?: string): Promise<string | undefined>;
 	send(
 		text: string,
-		attachmentPaths?: string[],
+		attachments?: OutboundAttachment[],
 		signal?: AbortSignal,
 		replyToMessageId?: string,
 	): Promise<string | undefined>;

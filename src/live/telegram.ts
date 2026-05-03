@@ -3,13 +3,7 @@ import type { InboundMessageInput } from "../core/runtime-types.js";
 import { chunkText } from "../render/chunking.js";
 import { formatMarkdownForService, maxMessageLength } from "../render/format.js";
 import { StreamingPreview } from "../render/streaming.js";
-import {
-	fetchBinary,
-	guessAttachmentKind,
-	readLocalAttachment,
-	storeDownloadedAttachment,
-	textMentionsBot,
-} from "./common.js";
+import { fetchBinary, guessAttachmentKind, storeDownloadedAttachment, textMentionsBot } from "./common.js";
 import type { LiveConnection, LiveConnectionHandlers, ResumeState } from "./types.js";
 
 interface TelegramResponse<T> {
@@ -326,10 +320,10 @@ export async function connectTelegramLive(
 					})
 				).message_id,
 			),
-		send: async (text, attachmentPaths = [], signal, replyToMessageId) => {
+		send: async (text, attachments = [], signal, replyToMessageId) => {
 			const rendered = formatMarkdownForService("telegram", text);
 			const replyParam = replyToMessageId ? { reply_to_message_id: Number(replyToMessageId) } : {};
-			if (attachmentPaths.length === 0) {
+			if (attachments.length === 0) {
 				const chunks = chunkText(rendered.text, maxMessageLength("telegram"));
 				let firstId: string | undefined;
 				for (let i = 0; i < chunks.length; i++) {
@@ -352,8 +346,7 @@ export async function connectTelegramLive(
 				}
 				return firstId || "";
 			}
-			const [firstPath, ...rest] = attachmentPaths;
-			const first = await readLocalAttachment(firstPath);
+			const [first, ...rest] = attachments;
 			const firstKind = guessAttachmentKind(first.name, first.mimeType);
 			const firstMethod = firstKind === "image" ? "sendPhoto" : "sendDocument";
 			const firstField = firstKind === "image" ? "photo" : "document";
@@ -371,8 +364,7 @@ export async function connectTelegramLive(
 			const firstData = (await firstResponse.json()) as TelegramResponse<{ message_id: number }>;
 			if (!firstResponse.ok || !firstData.ok || firstData.result === undefined)
 				throw new Error(firstData.description || `${firstMethod} failed`);
-			for (const path of rest) {
-				const file = await readLocalAttachment(path);
+			for (const file of rest) {
 				const kind = guessAttachmentKind(file.name, file.mimeType);
 				const method = kind === "image" ? "sendPhoto" : "sendDocument";
 				const field = kind === "image" ? "photo" : "document";
