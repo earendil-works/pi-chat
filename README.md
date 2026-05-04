@@ -1,6 +1,6 @@
 # pi-chat
 
-A pi extension that bridges Discord and Telegram channels to sandboxed pi sessions. Each connected channel gets its own [Gondolin](https://github.com/earendil-works/gondolin) micro-VM with persistent workspace, shared storage, memory, and skills. Telegram workers listen once per bot account and dispatch updates to the configured DMs/groups for that account.
+A pi extension that bridges Discord and Telegram channels to sandboxed pi sessions. Each connected channel gets its own [Gondolin](https://github.com/earendil-works/gondolin) micro-VM with persistent workspace, shared storage, memory, and skills. Telegram multi-channel orchestration uses one dispatcher per bot account to poll updates and spool them to independent per-channel workers.
 
 ## Quick Start
 
@@ -67,18 +67,18 @@ pi -e /path/to/pi-chat
 | Command | Description |
 |---------|-------------|
 | `/chat-config` | Configure accounts, channels, and secrets |
-| `/chat-connect` | Connect to a configured channel, or a Telegram account dispatcher |
+| `/chat-connect` | Connect to a configured channel |
 | `/chat-disconnect` | Disconnect the current channel |
 | `/chat-status` | Show connection status, model, usage, context |
 | `/chat-list` | List configured channels |
-| `/chat-spawn-all` | Spawn Discord channel workers and Telegram account dispatchers in detached tmux/pi sessions |
+| `/chat-spawn-all` | Spawn every configured channel worker, plus one Telegram dispatcher per account |
 | `/chat-spawn-all --restart` | Restart those tmux/pi sessions |
 | `/chat-workers` | Show managed tmux/pi worker status |
 | `/chat-open-all` | Open running workers in a tiled tmux dashboard |
 | `/chat-kill-all` | Kill all managed tmux/pi workers |
 | `/chat-new` | Start a new pi session, keeping the chat connection |
 
-Workers also write per-channel status snapshots every 15 seconds under `~/.pi/agent/chat/worker-status/`. Telegram account dispatchers write one snapshot per configured DM/group while sharing one polling loop for the bot token.
+Workers also write status snapshots every 15 seconds under `~/.pi/agent/chat/worker-status/`. Telegram dispatchers do not run agents; they own the single `getUpdates` loop for a bot token and write inbound messages to per-channel queues consumed by the channel workers.
 
 ---
 
@@ -124,7 +124,7 @@ Everything lives under `~/.pi/agent/chat/`:
 
 ## VM Environment
 
-Each connected channel starts a Gondolin micro-VM with:
+Each connection starts a Gondolin micro-VM with:
 
 - **Alpine Linux** with bash pre-installed
 - `/workspace` → channel workspace directory

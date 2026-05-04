@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { type Dirent, constants as fsConstants } from "node:fs";
-import { lstat, mkdir, open, readdir, readFile, realpath, unlink, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, isAbsolute, join, relative } from "node:path";
+import { lstat, mkdir, open, readdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { basename, extname, isAbsolute, join, relative } from "node:path";
 import { ensureGuestAssets, hasGuestAssets } from "@earendil-works/gondolin";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
@@ -22,9 +22,7 @@ import {
 	CHAT_CONFIG_PATH,
 	CHAT_HOME,
 	ensureChatHome,
-	getAccountRuntimePath,
 	listConfiguredConversations,
-	listConfiguredConversationsForAccount,
 	loadChatConfig,
 	resolveConversation,
 } from "./src/config.js";
@@ -32,7 +30,11 @@ import {
 import type { ResolvedConversation, TelegramAccountConfig } from "./src/core/config-types.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
 import { connectLive } from "./src/live/index.js";
-import { connectTelegramAccountLive, type TelegramAccountLiveConnection } from "./src/live/telegram.js";
+import {
+	connectTelegramDispatcher,
+	connectTelegramQueuedLive,
+	type TelegramDispatcherConnection,
+} from "./src/live/telegram-queue.js";
 import type { LiveConnection } from "./src/live/types.js";
 import { ConversationRuntime } from "./src/runtime.js";
 import { createSecretRequest, tryDecryptSecret } from "./src/secrets.js";
@@ -92,18 +94,15 @@ type AssistantSummary = {
 
 type PersistedChatState = {
 	conversationId?: string;
-	accountId?: string;
 };
 
 const SESSION_STATE_CUSTOM_TYPE = "pi-chat-state";
 const CHAT_CONVERSATION_FLAG = "chat-conversation";
-const CHAT_ACCOUNT_FLAG = "chat-account";
+const CHAT_TELEGRAM_DISPATCHER_FLAG = "chat-telegram-dispatcher";
+const CHAT_TELEGRAM_QUEUE_FLAG = "chat-telegram-queue";
 const WORKER_TMUX_PREFIX = "pi-chat-worker-";
 const DASHBOARD_TMUX_SESSION = "pi-chat-dashboard";
 const WORKER_STATUS_DIR = join(CHAT_HOME, "worker-status");
-const TELEGRAM_ACCOUNT_CURSOR_FILE = "telegram-cursor.json";
-const TELEGRAM_ACCOUNT_LOCK_FILE = ".telegram-poll.lock";
-const TELEGRAM_CONFIG_REFRESH_MS = 5000;
 
 interface WorkerStatusSnapshot {
 	conversationId: string;
@@ -130,26 +129,6 @@ interface ChatPromptSkill {
 	name: string;
 	description: string;
 	filePath: string;
-}
-
-interface ConversationSession {
-	conversationId: string;
-	runtime: ConversationRuntime;
-	sandbox: ConversationSandbox;
-	liveConnection?: LiveConnection;
-	closing?: boolean;
-	lastError?: string;
-}
-
-interface TelegramAccountWorker {
-	accountId: string;
-	accountName: string;
-	botToken: string;
-	liveConnection: TelegramAccountLiveConnection;
-	releaseLock: () => Promise<void>;
-	refreshInterval?: ReturnType<typeof setInterval>;
-	refreshInFlight?: boolean;
-	lastError?: string;
 }
 
 function isInsideHostPath(root: string, value: string): boolean {
@@ -270,13 +249,8 @@ function tmuxSafeName(value: string): string {
 	return `${WORKER_TMUX_PREFIX}${safe}`.slice(0, 100);
 }
 
-function telegramAccountTmuxName(accountId: string): string {
-	return tmuxSafeName(`telegram-account-${accountId}`);
-}
-
-function workerTmuxNameForConversation(conversation: ResolvedConversation): string {
-	if (conversation.service === "telegram") return telegramAccountTmuxName(conversation.accountId);
-	return tmuxSafeName(conversation.conversationId);
+function telegramDispatcherTmuxName(accountId: string): string {
+	return tmuxSafeName(`telegram-dispatcher-${accountId}`);
 }
 
 function shellQuote(value: string): string {
@@ -352,7 +326,7 @@ async function formatWorkerStatus(conversations: ResolvedConversation[]): Promis
 	const sessions = listTmuxSessions();
 	const lines: string[] = [];
 	for (const conversation of conversations) {
-		const tmuxName = workerTmuxNameForConversation(conversation);
+		const tmuxName = tmuxSafeName(conversation.conversationId);
 		const snapshot = await readWorkerStatus(conversation.conversationId);
 		const running = sessions.has(tmuxName);
 		const state = snapshot?.lastError ? `error: ${snapshot.lastError}` : (snapshot?.state ?? "unknown");
@@ -387,7 +361,12 @@ function createDashboardTmux(): string {
 	return DASHBOARD_TMUX_SESSION;
 }
 
-function spawnConversationTmux(ctx: ExtensionContext, conversation: ResolvedConversation, restart: boolean): string {
+function spawnConversationTmux(
+	ctx: ExtensionContext,
+	conversation: ResolvedConversation,
+	restart: boolean,
+	options: { telegramQueue?: boolean } = {},
+): string {
 	const tmuxName = tmuxSafeName(conversation.conversationId);
 	if (restart && tmuxSessionExists(tmuxName)) spawnSync("tmux", ["kill-session", "-t", tmuxName], { stdio: "ignore" });
 	if (tmuxSessionExists(tmuxName)) return `${conversation.conversationName}: already running (${tmuxName})`;
@@ -408,6 +387,7 @@ function spawnConversationTmux(ctx: ExtensionContext, conversation: ResolvedConv
 		...explicitExtensionCommandParts(),
 		`--${CHAT_CONVERSATION_FLAG}`,
 		shellQuote(conversation.conversationId),
+		...(options.telegramQueue ? [`--${CHAT_TELEGRAM_QUEUE_FLAG}`, "true"] : []),
 	].join(" ");
 	const result = spawnSync("tmux", ["new-session", "-d", "-s", tmuxName, "-c", ctx.cwd, command], {
 		encoding: "utf8",
@@ -420,29 +400,26 @@ function spawnConversationTmux(ctx: ExtensionContext, conversation: ResolvedConv
 	return `${conversation.conversationName}: started (${tmuxName})`;
 }
 
-function spawnTelegramAccountTmux(
+function spawnTelegramDispatcherTmux(
 	ctx: ExtensionContext,
 	accountId: string,
 	account: TelegramAccountConfig,
-	conversations: ResolvedConversation[],
 	restart: boolean,
 ): string {
-	const tmuxName = telegramAccountTmuxName(accountId);
+	const tmuxName = telegramDispatcherTmuxName(accountId);
 	if (restart) {
 		if (tmuxSessionExists(tmuxName)) spawnSync("tmux", ["kill-session", "-t", tmuxName], { stdio: "ignore" });
-		for (const conversation of conversations) {
-			const legacyName = tmuxSafeName(conversation.conversationId);
-			if (tmuxSessionExists(legacyName)) spawnSync("tmux", ["kill-session", "-t", legacyName], { stdio: "ignore" });
-		}
+		const previousAccountWorker = tmuxSafeName(`telegram-account-${accountId}`);
+		if (tmuxSessionExists(previousAccountWorker))
+			spawnSync("tmux", ["kill-session", "-t", previousAccountWorker], { stdio: "ignore" });
 	}
-	if (tmuxSessionExists(tmuxName)) return `${account.name ?? accountId}: already running (${tmuxName})`;
+	if (tmuxSessionExists(tmuxName)) return `${account.name ?? accountId} dispatcher: already running (${tmuxName})`;
 
 	const sessionDir = join(CHAT_HOME, "tmux-sessions", tmuxName);
 	const session = SessionManager.continueRecent(ctx.cwd, sessionDir);
-	session.appendCustomEntry(SESSION_STATE_CUSTOM_TYPE, { accountId });
-	session.appendSessionInfo(`pi-chat ${account.name ?? accountId} telegram account`);
+	session.appendSessionInfo(`pi-chat ${account.name ?? accountId} Telegram dispatcher`);
 	const sessionFile = session.getSessionFile();
-	if (!sessionFile) throw new Error(`Could not create pi session for ${account.name ?? accountId}`);
+	if (!sessionFile) throw new Error(`Could not create pi session for ${account.name ?? accountId} dispatcher`);
 
 	const command = [
 		"exec pi",
@@ -451,16 +428,18 @@ function spawnTelegramAccountTmux(
 		"--session-dir",
 		shellQuote(sessionDir),
 		...explicitExtensionCommandParts(),
-		`--${CHAT_ACCOUNT_FLAG}`,
+		`--${CHAT_TELEGRAM_DISPATCHER_FLAG}`,
 		shellQuote(accountId),
 	].join(" ");
 	const result = spawnSync("tmux", ["new-session", "-d", "-s", tmuxName, "-c", ctx.cwd, command], {
 		encoding: "utf8",
 	});
 	if (result.error || result.status !== 0) {
-		throw new Error(result.stderr.trim() || result.error?.message || `tmux failed for ${account.name ?? accountId}`);
+		throw new Error(
+			result.stderr.trim() || result.error?.message || `tmux failed for ${account.name ?? accountId} dispatcher`,
+		);
 	}
-	return `${account.name ?? accountId}: started ${conversations.length} Telegram channel(s) (${tmuxName})`;
+	return `${account.name ?? accountId} dispatcher: started (${tmuxName})`;
 }
 
 function abortError(): Error {
@@ -475,72 +454,6 @@ function waitForAbort(signal?: AbortSignal): Promise<never> {
 	return new Promise((_, reject) => {
 		signal.addEventListener("abort", () => reject(abortError()), { once: true });
 	});
-}
-
-function extractOwnerPid(owner: string): number | undefined {
-	const match = owner.match(/^pi-chat-(\d+)-/);
-	if (!match) return undefined;
-	const pid = Number(match[1]);
-	return Number.isFinite(pid) ? pid : undefined;
-}
-
-function isPidAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		const code =
-			error && typeof error === "object" && "code" in error ? String((error as { code?: string }).code) : undefined;
-		return code === "EPERM";
-	}
-}
-
-async function acquireTelegramAccountLock(accountId: string, owner: string): Promise<() => Promise<void>> {
-	const lockPath = getAccountRuntimePath(accountId, TELEGRAM_ACCOUNT_LOCK_FILE);
-	await mkdir(dirname(lockPath), { recursive: true });
-	try {
-		const handle = await open(lockPath, "wx");
-		try {
-			await handle.writeFile(`${owner}\n`, "utf8");
-		} finally {
-			await handle.close();
-		}
-		return async () => {
-			await unlink(lockPath).catch(() => undefined);
-		};
-	} catch (error) {
-		const code =
-			error && typeof error === "object" && "code" in error ? String((error as { code?: string }).code) : undefined;
-		if (code !== "EEXIST") throw error;
-	}
-	const existingOwner = (await readFile(lockPath, "utf8").catch(() => "")).trim();
-	const existingPid = extractOwnerPid(existingOwner);
-	if (existingPid !== undefined && !isPidAlive(existingPid)) {
-		await unlink(lockPath).catch(() => undefined);
-		return acquireTelegramAccountLock(accountId, owner);
-	}
-	throw new Error(`Telegram account is already polling in ${existingOwner || "another pi-chat session"}`);
-}
-
-async function readTelegramAccountCursor(accountId: string): Promise<string | undefined> {
-	try {
-		const data = JSON.parse(await readFile(getAccountRuntimePath(accountId, TELEGRAM_ACCOUNT_CURSOR_FILE), "utf8")) as {
-			cursor?: string;
-		};
-		return typeof data.cursor === "string" ? data.cursor : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-async function writeTelegramAccountCursor(accountId: string, cursor: string): Promise<void> {
-	const cursorPath = getAccountRuntimePath(accountId, TELEGRAM_ACCOUNT_CURSOR_FILE);
-	await mkdir(dirname(cursorPath), { recursive: true });
-	await writeFile(
-		cursorPath,
-		`${JSON.stringify({ cursor, updatedAt: new Date().toISOString() }, null, "\t")}\n`,
-		"utf8",
-	);
 }
 
 function formatTokens(count: number): string {
@@ -579,44 +492,43 @@ export default function (pi: ExtensionAPI) {
 		description: "Auto-connect pi-chat to a configured account/channel",
 		type: "string",
 	});
-	pi.registerFlag(CHAT_ACCOUNT_FLAG, {
-		description: "Auto-connect pi-chat to a configured Telegram account dispatcher",
+	pi.registerFlag(CHAT_TELEGRAM_DISPATCHER_FLAG, {
+		description: "Run the Telegram account dispatcher for a configured account",
+		type: "string",
+	});
+	pi.registerFlag(CHAT_TELEGRAM_QUEUE_FLAG, {
+		description: "Use the local Telegram dispatcher queue instead of polling getUpdates",
 		type: "string",
 	});
 
 	let runtime: ConversationRuntime | undefined;
 	let liveConnection: LiveConnection | undefined;
 	let sandbox: ConversationSandbox | undefined;
-	const conversationSessions = new Map<string, ConversationSession>();
-	let activeSession: ConversationSession | undefined;
-	let telegramAccountWorker: TelegramAccountWorker | undefined;
+	let telegramDispatcher: TelegramDispatcherConnection | undefined;
 	let ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
 	let chatTurnInFlight = false;
 	let configLoadedAtLeastOnce = false;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
-	let typingConnection: LiveConnection | undefined;
 	let workerStatusInterval: ReturnType<typeof setInterval> | undefined;
 	let queuedOutboundAttachments: string[] = [];
 	let pendingChatDispatch = false;
 	let pendingControlAction: (() => Promise<void>) | undefined;
 	let activeTriggerMessageId: string | undefined;
 
-	function persistChatState(state: PersistedChatState): void {
-		pi.appendEntry<PersistedChatState>(SESSION_STATE_CUSTOM_TYPE, state);
+	function persistChatState(conversationId?: string): void {
+		pi.appendEntry<PersistedChatState>(SESSION_STATE_CUSTOM_TYPE, { conversationId });
 	}
 
-	function getPersistedChatState(ctx: ExtensionContext): PersistedChatState {
+	function getPersistedConversationId(ctx: ExtensionContext): string | undefined {
 		const entries = ctx.sessionManager.getEntries();
 		for (let index = entries.length - 1; index >= 0; index--) {
 			const entry = entries[index] as unknown as Record<string, unknown>;
 			if (entry.type !== "custom" || entry.customType !== SESSION_STATE_CUSTOM_TYPE) continue;
 			const data = entry.data as PersistedChatState | undefined;
-			if (typeof data?.accountId === "string" && data.accountId.trim()) return { accountId: data.accountId.trim() };
-			if (typeof data?.conversationId === "string" && data.conversationId.trim())
-				return { conversationId: data.conversationId.trim() };
-			return {};
+			if (typeof data?.conversationId === "string" && data.conversationId.trim()) return data.conversationId;
+			return undefined;
 		}
-		return {};
+		return undefined;
 	}
 
 	function stableSecretsKey(secrets: Record<string, { value: string; hosts: string[] }>): string {
@@ -629,33 +541,6 @@ export default function (pi: ExtensionAPI) {
 
 	function getLocalToolCwd(ctx: ExtensionContext): string {
 		return ctx.cwd;
-	}
-
-	function setActiveSession(session: ConversationSession | undefined): void {
-		activeSession = session;
-		runtime = session?.runtime;
-		sandbox = session?.sandbox;
-		liveConnection = session?.liveConnection;
-	}
-
-	function updateSessionConversation(session: ConversationSession, conversation: ResolvedConversation): void {
-		Object.assign(session.runtime.conversation, conversation);
-		if (session.liveConnection) Object.assign(session.liveConnection.conversation, conversation);
-		session.conversationId = session.runtime.conversation.conversationId;
-	}
-
-	async function closeConversationSession(
-		ctx: ExtensionContext,
-		session: ConversationSession,
-		error = "disconnected",
-	): Promise<void> {
-		await writeWorkerStatusForSession(ctx, session, error).catch(() => undefined);
-		conversationSessions.delete(session.conversationId);
-		if (activeSession === session) setActiveSession(undefined);
-		const currentSandbox = session.sandbox;
-		session.liveConnection = undefined;
-		await currentSandbox.close().catch(() => undefined);
-		await session.runtime.disconnect().catch(() => undefined);
 	}
 
 	function isSandboxActive(): boolean {
@@ -706,6 +591,37 @@ export default function (pi: ExtensionAPI) {
 			await ensureGuestAssets();
 		});
 		if (result.error) throw new Error(result.error);
+	}
+
+	function updateDispatcherStatus(ctx: ExtensionContext, accountName: string, error?: string): void {
+		const theme = ctx.ui.theme;
+		const label = theme.fg("accent", "chat");
+		if (error) {
+			ctx.ui.setStatus("chat", `${label} ${theme.fg("error", `dispatcher ${accountName}: ${error}`)}`);
+			return;
+		}
+		ctx.ui.setStatus("chat", `${label} ${theme.fg("success", `dispatcher ${accountName}`)}`);
+	}
+
+	async function connectTelegramDispatcherProcess(ctx: ExtensionContext, accountId: string): Promise<boolean> {
+		const config = await loadChatConfig();
+		const account = config.accounts[accountId];
+		if (!account || account.service !== "telegram") {
+			updateDispatcherStatus(ctx, accountId, `Unknown Telegram account: ${accountId}`);
+			return false;
+		}
+		const accountName = account.name ?? (account.botUsername ? `@${account.botUsername}` : accountId);
+		const result = await runWithLoader(ctx, `Starting ${accountName} Telegram dispatcher...`, async () => {
+			telegramDispatcher = await connectTelegramDispatcher(accountId, ownerId, async (error) => {
+				updateDispatcherStatus(ctx, accountName, error.message);
+			});
+		});
+		if (result.error) {
+			updateDispatcherStatus(ctx, accountName, result.error);
+			return false;
+		}
+		updateDispatcherStatus(ctx, accountName);
+		return true;
 	}
 
 	async function buildMemoryPromptSuffix(): Promise<string> {
@@ -800,15 +716,6 @@ export default function (pi: ExtensionAPI) {
 			const percent = usage.percent !== null ? `${usage.percent.toFixed(1)}%` : "?";
 			lines.push(`Context: ${percent}/${formatTokens(contextWindow)}`);
 		}
-		if (telegramAccountWorker) {
-			const sessions = [...conversationSessions.values()].filter((session) => !session.closing);
-			const queueLength = sessions.reduce((sum, session) => sum + session.runtime.getStatus().queueLength, 0);
-			lines.push(`Telegram account: ${telegramAccountWorker.accountName}`);
-			lines.push(`Channels: ${sessions.length}`);
-			lines.push(`Queue: ${queueLength}${chatTurnInFlight ? " (active)" : ""}`);
-			if (runtime) lines.push(`Active chat: ${runtime.conversation.conversationName}`);
-			return lines.join("\n") || "No usage data yet.";
-		}
 		if (runtime) {
 			const status = runtime.getStatus();
 			lines.push(`Chat: ${status.conversationName}`);
@@ -832,306 +739,14 @@ export default function (pi: ExtensionAPI) {
 			await showNotice(ctx, "Sandbox restart error", message, "error");
 			return false;
 		}
-		const session = conversationSessions.get(conversation.conversationId);
-		const previousSandbox = session?.sandbox ?? sandbox;
-		if (session) {
-			session.sandbox = nextSandbox;
-			updateSessionConversation(session, conversation);
-			if (activeSession === session) setActiveSession(session);
-		} else {
-			sandbox = nextSandbox;
-			if (runtime && runtime.conversation.conversationId === conversation.conversationId) {
-				Object.assign(runtime.conversation, conversation);
-			}
+		const previousSandbox = sandbox;
+		sandbox = nextSandbox;
+		if (runtime && runtime.conversation.conversationId === conversation.conversationId) {
+			Object.assign(runtime.conversation, conversation);
 		}
 		if (previousSandbox) await previousSandbox.close().catch(() => undefined);
 		await showChatContextMessage();
 		updateStatus(ctx);
-		return true;
-	}
-
-	async function createConversationSession(
-		conversation: ResolvedConversation,
-		liveConnection?: LiveConnection,
-	): Promise<ConversationSession> {
-		const nextRuntime = await ConversationRuntime.connect(conversation, ownerId);
-		const nextSandbox = new ConversationSandbox(conversation);
-		try {
-			await nextSandbox.start();
-		} catch (error) {
-			await nextRuntime.disconnect().catch(() => undefined);
-			await nextSandbox.close().catch(() => undefined);
-			throw error;
-		}
-		return {
-			conversationId: conversation.conversationId,
-			runtime: nextRuntime,
-			sandbox: nextSandbox,
-			liveConnection,
-		};
-	}
-
-	async function handleConversationMessage(
-		ctx: ExtensionContext,
-		session: ConversationSession,
-		input: Parameters<ConversationRuntime["ingestInbound"]>[0],
-		checkpoint?: { cursor?: string; messageId?: string },
-	): Promise<void> {
-		if (session.closing) return;
-		if (!chatTurnInFlight || activeSession === session) setActiveSession(session);
-		const secretResult = tryDecryptSecret(input.text);
-		if (secretResult) {
-			const vm = await session.sandbox.start();
-			await vm.fs.mkdir("/workspace/.secrets", { recursive: true });
-			await vm.fs.writeFile(`/workspace/.secrets/${secretResult.name}`, secretResult.decrypted);
-			await session.liveConnection?.sendImmediate(
-				`\u2705 Secret received and stored as /workspace/.secrets/${secretResult.name}`,
-			);
-			if (checkpoint) await session.runtime.noteCheckpoint(checkpoint);
-			const notification: typeof input = {
-				...input,
-				text: `[secret stored: ${secretResult.name} at /workspace/.secrets/${secretResult.name}]`,
-				mentionedBot: true,
-			};
-			await session.runtime.ingestInbound(notification, checkpoint);
-			await tryDispatch(ctx);
-			return;
-		}
-		const control = session.runtime.isArmed() ? session.runtime.parseControlCommand(input) : undefined;
-		if (control === "stop") {
-			if (chatTurnInFlight || !ctx.isIdle()) {
-				ctx.abort();
-				await session.liveConnection?.sendImmediate("Aborted current turn.");
-			} else {
-				await session.liveConnection?.sendImmediate("No active turn.");
-			}
-			return;
-		}
-		if (control === "compact") {
-			const runCompact = async () => {
-				ctx.compact({
-					onComplete: () => void session.liveConnection?.sendImmediate("Compaction completed."),
-					onError: (error) => void session.liveConnection?.sendImmediate(`Compaction failed: ${error.message}`),
-				});
-				await session.liveConnection?.sendImmediate("Compaction started.");
-			};
-			if (chatTurnInFlight || !ctx.isIdle()) {
-				pendingControlAction = runCompact;
-				ctx.abort();
-				await session.liveConnection?.sendImmediate("Aborting current turn, then compacting.");
-				return;
-			}
-			await runCompact();
-			return;
-		}
-		if (control === "status") {
-			await session.liveConnection?.sendImmediate(buildRemoteStatus(ctx));
-			return;
-		}
-		if (control === "new") {
-			const queueNewSession = async () => {
-				pi.sendUserMessage("/chat-new", { deliverAs: "followUp" });
-				await session.liveConnection?.sendImmediate("Starting a new pi session.");
-			};
-			if (chatTurnInFlight || !ctx.isIdle()) {
-				pendingControlAction = queueNewSession;
-				ctx.abort();
-				await session.liveConnection?.sendImmediate("Aborting current turn, then starting a new pi session.");
-				return;
-			}
-			await queueNewSession();
-			return;
-		}
-		await session.runtime.ingestInbound(input, checkpoint);
-		await tryDispatch(ctx);
-	}
-
-	async function handleConversationError(
-		ctx: ExtensionContext,
-		session: ConversationSession,
-		error: Error,
-	): Promise<void> {
-		session.lastError = error.message;
-		await session.runtime.appendError(error.message);
-		updateStatus(ctx, error.message);
-	}
-
-	function telegramAccountDisplayName(accountId: string, account: TelegramAccountConfig): string {
-		return account.name ?? (account.botUsername ? `@${account.botUsername}` : accountId);
-	}
-
-	async function closeInactiveClosingSessions(ctx: ExtensionContext): Promise<void> {
-		for (const session of [...conversationSessions.values()]) {
-			if (!session.closing) continue;
-			if (chatTurnInFlight && activeSession === session) continue;
-			await closeConversationSession(ctx, session, "removed from config");
-		}
-		if (!activeSession) {
-			const nextSession = [...conversationSessions.values()].find((session) => !session.closing);
-			if (nextSession) setActiveSession(nextSession);
-		}
-	}
-
-	async function refreshTelegramAccountConversations(ctx: ExtensionContext): Promise<void> {
-		const worker = telegramAccountWorker;
-		if (!worker || worker.refreshInFlight) return;
-		worker.refreshInFlight = true;
-		try {
-			const config = await loadChatConfig();
-			const account = config.accounts[worker.accountId];
-			if (!account || account.service !== "telegram") {
-				await disconnectRuntime(ctx, true);
-				return;
-			}
-			if (account.botToken !== worker.botToken) {
-				await connectTelegramAccount(ctx, worker.accountId, false);
-				return;
-			}
-			const telegramAccount = account as TelegramAccountConfig;
-			worker.accountName = telegramAccountDisplayName(worker.accountId, telegramAccount);
-			const nextConversations = listConfiguredConversationsForAccount(config, worker.accountId).filter(
-				(conversation) => conversation.service === "telegram",
-			);
-			const nextIds = new Set(nextConversations.map((conversation) => conversation.conversationId));
-			for (const session of conversationSessions.values()) {
-				if (nextIds.has(session.conversationId)) continue;
-				session.closing = true;
-				if (activeSession === session && chatTurnInFlight) ctx.abort();
-			}
-			for (const conversation of nextConversations) {
-				const existing = conversationSessions.get(conversation.conversationId);
-				if (existing) {
-					updateSessionConversation(existing, conversation);
-					existing.closing = false;
-					existing.lastError = undefined;
-					if (activeSession === existing) setActiveSession(existing);
-					continue;
-				}
-				const session = await createConversationSession(conversation);
-				session.runtime.armAfterCurrentTail();
-				session.liveConnection = worker.liveConnection.createConversationConnection(session.runtime.conversation);
-				conversationSessions.set(session.conversationId, session);
-				if (!activeSession) setActiveSession(session);
-			}
-			worker.liveConnection.updateConversations(
-				[...conversationSessions.values()]
-					.filter((session) => !session.closing)
-					.map((session) => session.runtime.conversation),
-			);
-			await closeInactiveClosingSessions(ctx);
-			worker.lastError = undefined;
-			updateStatus(ctx);
-			await tryDispatch(ctx);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			worker.lastError = message;
-			updateStatus(ctx, message);
-		} finally {
-			if (telegramAccountWorker === worker) worker.refreshInFlight = false;
-		}
-	}
-
-	function startTelegramConfigRefresh(ctx: ExtensionContext): void {
-		const worker = telegramAccountWorker;
-		if (!worker) return;
-		if (worker.refreshInterval) clearInterval(worker.refreshInterval);
-		worker.refreshInterval = setInterval(() => {
-			void refreshTelegramAccountConversations(ctx).catch(() => undefined);
-		}, TELEGRAM_CONFIG_REFRESH_MS);
-	}
-
-	async function connectTelegramAccount(
-		ctx: ExtensionContext,
-		accountId: string,
-		interactive = true,
-	): Promise<boolean> {
-		const config = await loadChatConfig();
-		const account = config.accounts[accountId];
-		if (!account || account.service !== "telegram") {
-			if (interactive) await showNotice(ctx, "Connect error", `Unknown Telegram account: ${accountId}`, "error");
-			return false;
-		}
-		const telegramAccount = account as TelegramAccountConfig;
-		const accountName = telegramAccountDisplayName(accountId, telegramAccount);
-		await disconnectRuntime(ctx, false);
-		try {
-			await prepareGondolin(ctx);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			updateStatus(ctx, message);
-			if (interactive) await showNotice(ctx, "Connect error", message, "error");
-			return false;
-		}
-		let releaseLock: (() => Promise<void>) | undefined;
-		const result = await runWithLoader(ctx, `Connecting ${accountName} Telegram...`, async () => {
-			releaseLock = await acquireTelegramAccountLock(accountId, ownerId);
-			const conversations = listConfiguredConversationsForAccount(config, accountId).filter(
-				(conversation) => conversation.service === "telegram",
-			);
-			const createdSessions: ConversationSession[] = [];
-			try {
-				for (const conversation of conversations) {
-					const session = await createConversationSession(conversation);
-					createdSessions.push(session);
-					conversationSessions.set(session.conversationId, session);
-				}
-				const cursor = await readTelegramAccountCursor(accountId);
-				const accountLiveConnection = await connectTelegramAccountLive(
-					accountId,
-					telegramAccount,
-					conversations,
-					{
-						onMessage: async (conversation, input, checkpoint) => {
-							const session = conversationSessions.get(conversation.conversationId);
-							if (!session) return;
-							await handleConversationMessage(ctx, session, input, checkpoint);
-						},
-						onCaughtUp: async () => {
-							for (const session of conversationSessions.values()) session.runtime.armAfterCurrentTail();
-						},
-						onCursor: async (cursor) => {
-							await writeTelegramAccountCursor(accountId, cursor);
-						},
-						onError: async (error) => {
-							if (telegramAccountWorker) telegramAccountWorker.lastError = error.message;
-							updateStatus(ctx, error.message);
-						},
-					},
-					cursor,
-				);
-				telegramAccountWorker = {
-					accountId,
-					accountName,
-					botToken: telegramAccount.botToken,
-					liveConnection: accountLiveConnection,
-					releaseLock,
-				};
-				releaseLock = undefined;
-				for (const session of conversationSessions.values()) {
-					session.liveConnection = accountLiveConnection.createConversationConnection(session.runtime.conversation);
-				}
-				const firstSession = [...conversationSessions.values()][0];
-				if (firstSession) setActiveSession(firstSession);
-				startTelegramConfigRefresh(ctx);
-			} catch (error) {
-				for (const session of createdSessions.reverse())
-					await closeConversationSession(ctx, session).catch(() => undefined);
-				throw error;
-			}
-		});
-		if (result.error) {
-			if (releaseLock) await releaseLock().catch(() => undefined);
-			await disconnectRuntime(ctx, false);
-			updateStatus(ctx, result.error);
-			if (interactive) await showNotice(ctx, "Connect error", result.error, "error");
-			return false;
-		}
-		persistChatState({ accountId });
-		startWorkerStatusLoop(ctx);
-		if (interactive) ctx.ui.notify(`Connected ${accountName} Telegram account`, "info");
-		await showChatContextMessage();
-		updateStatus(ctx);
-		await tryDispatch(ctx);
 		return true;
 	}
 
@@ -1146,7 +761,6 @@ export default function (pi: ExtensionAPI) {
 			if (interactive) await showNotice(ctx, "Connect error", `Unknown configured channel: ${conversationId}`, "error");
 			return false;
 		}
-		if (conversation.service === "telegram") return connectTelegramAccount(ctx, conversation.accountId, interactive);
 		await disconnectRuntime(ctx, false);
 		try {
 			await prepareGondolin(ctx);
@@ -1157,43 +771,121 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		const result = await runWithLoader(ctx, `Connecting ${conversation.conversationName}...`, async () => {
-			const session = await createConversationSession(conversation);
-			conversationSessions.set(session.conversationId, session);
-			setActiveSession(session);
-			const connectedLiveConnection = await connectLive(
+			runtime = await ConversationRuntime.connect(conversation, ownerId);
+			sandbox = new ConversationSandbox(conversation);
+			await sandbox.start();
+			const useTelegramQueue =
+				conversation.service === "telegram" && String(pi.getFlag(CHAT_TELEGRAM_QUEUE_FLAG) ?? "") === "true";
+			liveConnection = await (useTelegramQueue ? connectTelegramQueuedLive : connectLive)(
 				conversation,
 				{
 					onMessage: async (input, checkpoint) => {
-						await handleConversationMessage(ctx, session, input, checkpoint);
+						if (!runtime) return;
+						const secretResult = tryDecryptSecret(input.text);
+						if (secretResult) {
+							if (sandbox) {
+								const vm = await sandbox.start();
+								await vm.fs.mkdir("/workspace/.secrets", { recursive: true });
+								await vm.fs.writeFile(`/workspace/.secrets/${secretResult.name}`, secretResult.decrypted);
+							}
+							await liveConnection?.sendImmediate(
+								`\u2705 Secret received and stored as /workspace/.secrets/${secretResult.name}`,
+							);
+							if (checkpoint) await runtime.noteCheckpoint(checkpoint);
+							const notification: typeof input = {
+								...input,
+								text: `[secret stored: ${secretResult.name} at /workspace/.secrets/${secretResult.name}]`,
+								mentionedBot: true,
+							};
+							await runtime.ingestInbound(notification, checkpoint);
+							await tryDispatch(ctx);
+							return;
+						}
+						const control = runtime.isArmed() ? runtime.parseControlCommand(input) : undefined;
+						if (control === "stop") {
+							if (chatTurnInFlight || !ctx.isIdle()) {
+								ctx.abort();
+								await liveConnection?.sendImmediate("Aborted current turn.");
+							} else {
+								await liveConnection?.sendImmediate("No active turn.");
+							}
+							return;
+						}
+						if (control === "compact") {
+							const runCompact = async () => {
+								ctx.compact({
+									onComplete: () => void liveConnection?.sendImmediate("Compaction completed."),
+									onError: (error) => void liveConnection?.sendImmediate(`Compaction failed: ${error.message}`),
+								});
+								await liveConnection?.sendImmediate("Compaction started.");
+							};
+							if (chatTurnInFlight || !ctx.isIdle()) {
+								pendingControlAction = runCompact;
+								ctx.abort();
+								await liveConnection?.sendImmediate("Aborting current turn, then compacting.");
+								return;
+							}
+							await runCompact();
+							return;
+						}
+						if (control === "status") {
+							await liveConnection?.sendImmediate(buildRemoteStatus(ctx));
+							return;
+						}
+						if (control === "new") {
+							const queueNewSession = async () => {
+								pi.sendUserMessage("/chat-new", { deliverAs: "followUp" });
+								await liveConnection?.sendImmediate("Starting a new pi session.");
+							};
+							if (chatTurnInFlight || !ctx.isIdle()) {
+								pendingControlAction = queueNewSession;
+								ctx.abort();
+								await liveConnection?.sendImmediate("Aborting current turn, then starting a new pi session.");
+								return;
+							}
+							await queueNewSession();
+							return;
+						}
+						await runtime.ingestInbound(input, checkpoint);
+						await tryDispatch(ctx);
 					},
 					onCaughtUp: async () => {
-						session.runtime.armAfterCurrentTail();
+						runtime?.armAfterCurrentTail();
 					},
 					onError: async (error) => {
-						await handleConversationError(ctx, session, error);
+						if (runtime) await runtime.appendError(error.message);
+						updateStatus(ctx, error.message);
 					},
 					onDisconnect: async () => {
-						const cid = session.runtime.conversation.conversationId;
+						if (!runtime) return;
+						const cid = runtime.conversation.conversationId;
 						updateStatus(ctx, "disconnected, reconnecting...");
-						if (session.liveConnection) {
-							await session.liveConnection.disconnect().catch(() => undefined);
-							session.liveConnection = undefined;
+						if (liveConnection) {
+							await liveConnection.disconnect().catch(() => undefined);
+							liveConnection = undefined;
 						}
 						await connectConversation(ctx, cid, false);
 					},
 				},
-				session.runtime.getLastCheckpoint(),
+				runtime.getLastCheckpoint(),
 			);
-			session.liveConnection = connectedLiveConnection;
-			setActiveSession(session);
 		});
 		if (result.error) {
-			await disconnectRuntime(ctx, false);
+			if (liveConnection) {
+				await liveConnection.disconnect().catch(() => undefined);
+				liveConnection = undefined;
+			}
+			if (sandbox) {
+				await sandbox.close().catch(() => undefined);
+				sandbox = undefined;
+			}
+			if (runtime) await runtime.disconnect().catch(() => undefined);
+			runtime = undefined;
 			updateStatus(ctx, result.error);
 			if (interactive) await showNotice(ctx, "Connect error", result.error, "error");
 			return false;
 		}
-		persistChatState({ conversationId: conversation.conversationId });
+		persistChatState(conversation.conversationId);
 		startWorkerStatusLoop(ctx);
 		if (interactive) ctx.ui.notify(`Connected ${conversation.conversationName}`, "info");
 		await showChatContextMessage();
@@ -1230,45 +922,32 @@ export default function (pi: ExtensionAPI) {
 		pi.sendMessage({ customType: "chat-context", content: sections.join("\n"), display: true });
 	}
 
-	async function writeWorkerStatusForSession(
-		ctx: ExtensionContext,
-		session: ConversationSession,
-		error?: string,
-	): Promise<void> {
-		const status = session.runtime.getStatus();
+	async function writeWorkerStatus(ctx: ExtensionContext, error?: string): Promise<void> {
+		if (!runtime) return;
+		const status = runtime.getStatus();
 		const usage = ctx.getContextUsage();
-		const lastError = error ?? session.lastError ?? telegramAccountWorker?.lastError;
 		const snapshot: WorkerStatusSnapshot = {
 			conversationId: status.conversationId,
 			conversationName: status.conversationName,
-			service: session.runtime.conversation.service,
+			service: runtime.conversation.service,
 			pid: process.pid,
 			cwd: ctx.cwd,
 			sessionFile: ctx.sessionManager.getSessionFile(),
-			tmuxSession: workerTmuxNameForConversation(session.runtime.conversation),
-			state: lastError ? "error" : "connected",
+			tmuxSession: tmuxSafeName(status.conversationId),
+			state: error ? "error" : "connected",
 			updatedAt: new Date().toISOString(),
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 			thinking: pi.getThinkingLevel(),
 			contextPercent: usage?.percent,
 			queueLength: status.queueLength,
 			hasActiveJob: status.hasActiveJob,
-			chatTurnInFlight: chatTurnInFlight && activeSession === session,
+			chatTurnInFlight,
 			recordCount: status.recordCount,
 			lastRecordId: status.lastRecordId,
-			lastError,
+			lastError: error,
 		};
 		await mkdir(WORKER_STATUS_DIR, { recursive: true });
 		await writeFile(workerStatusPath(status.conversationId), `${JSON.stringify(snapshot, null, "\t")}\n`, "utf8");
-	}
-
-	async function writeWorkerStatus(ctx: ExtensionContext, error?: string): Promise<void> {
-		if (conversationSessions.size > 0) {
-			for (const session of conversationSessions.values()) await writeWorkerStatusForSession(ctx, session, error);
-			return;
-		}
-		if (!activeSession) return;
-		await writeWorkerStatusForSession(ctx, activeSession, error);
 	}
 
 	function startWorkerStatusLoop(ctx: ExtensionContext): void {
@@ -1293,15 +972,6 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("chat", `${label} ${theme.fg("error", error)}`);
 			return;
 		}
-		if (telegramAccountWorker) {
-			const sessions = [...conversationSessions.values()].filter((session) => !session.closing);
-			const queueLength = sessions.reduce((sum, session) => sum + session.runtime.getStatus().queueLength, 0);
-			const details = [`${telegramAccountWorker.accountName} (${sessions.length})`];
-			if (chatTurnInFlight && activeSession) details.push(`active: ${activeSession.runtime.conversation.channelKey}`);
-			if (queueLength > 0) details.push(`q:${queueLength}`);
-			ctx.ui.setStatus("chat", `${label} ${theme.fg("success", details.join(" | "))}`);
-			return;
-		}
 		if (!runtime) {
 			ctx.ui.setStatus("chat", `${label} ${theme.fg("muted", "disconnected")}`);
 			return;
@@ -1315,21 +985,18 @@ export default function (pi: ExtensionAPI) {
 
 	function startTypingLoop(): void {
 		if (!liveConnection || typingInterval) return;
-		typingConnection = liveConnection;
-		void typingConnection.startTyping();
+		void liveConnection.startTyping();
 		typingInterval = setInterval(() => {
-			void typingConnection?.startTyping();
+			void liveConnection?.startTyping();
 		}, 4000);
 	}
 
 	function stopTypingLoop(): void {
-		const connection = typingConnection;
 		if (typingInterval) {
 			clearInterval(typingInterval);
 			typingInterval = undefined;
 		}
-		typingConnection = undefined;
-		void connection?.stopTyping();
+		void liveConnection?.stopTyping();
 	}
 
 	pi.registerTool({
@@ -1507,32 +1174,18 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	async function tryDispatch(ctx: ExtensionContext): Promise<void> {
-		if (chatTurnInFlight || !ctx.isIdle()) return;
-		const candidates =
-			conversationSessions.size > 0
-				? [...conversationSessions.values()].filter((session) => !session.closing && session.liveConnection)
-				: activeSession
-					? [activeSession]
-					: [];
-		let dispatchSession: ConversationSession | undefined;
-		let next: ReturnType<ConversationRuntime["beginNextJob"]> | undefined;
-		for (const session of candidates) {
-			next = session.runtime.beginNextJob();
-			if (!next) continue;
-			dispatchSession = session;
-			break;
-		}
-		if (!dispatchSession || !next) {
+		if (!runtime || chatTurnInFlight || !ctx.isIdle()) return;
+		const next = runtime.beginNextJob();
+		if (!next) {
 			updateStatus(ctx);
 			return;
 		}
-		setActiveSession(dispatchSession);
 		try {
 			chatTurnInFlight = true;
 			activeTriggerMessageId = next.triggerMessageId;
 			queuedOutboundAttachments = [];
 			pendingChatDispatch = true;
-			dispatchSession.liveConnection?.setReplyTo(activeTriggerMessageId);
+			liveConnection?.setReplyTo(activeTriggerMessageId);
 			startTypingLoop();
 			pi.sendUserMessage(next.prompt);
 			updateStatus(ctx);
@@ -1541,7 +1194,7 @@ export default function (pi: ExtensionAPI) {
 			chatTurnInFlight = false;
 			stopTypingLoop();
 			const message = error instanceof Error ? error.message : String(error);
-			await dispatchSession.runtime.failActiveJob(`dispatch failed: ${message}`);
+			await runtime.failActiveJob(`dispatch failed: ${message}`);
 			updateStatus(ctx, message);
 		}
 	}
@@ -1549,27 +1202,25 @@ export default function (pi: ExtensionAPI) {
 	async function disconnectRuntime(ctx: ExtensionContext, clearPersistedState = true): Promise<void> {
 		stopTypingLoop();
 		stopWorkerStatusLoop();
-		await writeWorkerStatus(ctx, "disconnected").catch(() => undefined);
-		const worker = telegramAccountWorker;
-		telegramAccountWorker = undefined;
-		if (worker?.refreshInterval) clearInterval(worker.refreshInterval);
-		if (worker) {
-			await worker.liveConnection.disconnect().catch(() => undefined);
-			await worker.releaseLock().catch(() => undefined);
-		}
-		const sessions = [...conversationSessions.values()];
-		conversationSessions.clear();
+		const dispatcher = telegramDispatcher;
+		telegramDispatcher = undefined;
+		if (dispatcher) await dispatcher.disconnect().catch(() => undefined);
+		if (runtime) await writeWorkerStatus(ctx, "disconnected").catch(() => undefined);
+		const connection = liveConnection;
 		liveConnection = undefined;
+		if (connection) await connection.disconnect().catch(() => undefined);
+		const currentSandbox = sandbox;
 		sandbox = undefined;
-		runtime = undefined;
-		activeSession = undefined;
-		chatTurnInFlight = false;
-		for (const session of sessions) {
-			if (!worker) await session.liveConnection?.disconnect().catch(() => undefined);
-			await session.sandbox.close().catch(() => undefined);
-			await session.runtime.disconnect().catch(() => undefined);
+		if (currentSandbox) await currentSandbox.close().catch(() => undefined);
+		if (!runtime) {
+			updateStatus(ctx);
+			return;
 		}
-		if (clearPersistedState) persistChatState({});
+		const current = runtime;
+		runtime = undefined;
+		chatTurnInFlight = false;
+		await current.disconnect();
+		if (clearPersistedState) persistChatState(undefined);
 		updateStatus(ctx);
 	}
 
@@ -1592,7 +1243,6 @@ export default function (pi: ExtensionAPI) {
 			const conversationId = runtime?.conversation.conversationId;
 			const beforeSecrets = runtime ? stableSecretsKey(runtime.conversation.gondolinSecrets) : undefined;
 			await runChatConfigUI(ctx);
-			if (telegramAccountWorker) await refreshTelegramAccountConversations(ctx);
 			if (!conversationId || !runtime) return;
 			const updatedConfig = await loadChatConfig();
 			const updatedConversation = resolveConversation(updatedConfig, conversationId);
@@ -1646,19 +1296,19 @@ export default function (pi: ExtensionAPI) {
 			const lines: string[] = [];
 			const telegramAccountIds = new Set<string>();
 			for (const conversation of configured) {
-				if (conversation.service !== "telegram") {
-					lines.push(spawnConversationTmux(ctx, conversation, restart));
-					continue;
-				}
-				telegramAccountIds.add(conversation.accountId);
+				if (conversation.service === "telegram") telegramAccountIds.add(conversation.accountId);
 			}
 			for (const accountId of [...telegramAccountIds].sort()) {
 				const account = config.accounts[accountId];
 				if (!account || account.service !== "telegram") continue;
-				const conversations = configured.filter(
-					(conversation) => conversation.service === "telegram" && conversation.accountId === accountId,
+				lines.push(spawnTelegramDispatcherTmux(ctx, accountId, account as TelegramAccountConfig, restart));
+			}
+			for (const conversation of configured) {
+				lines.push(
+					spawnConversationTmux(ctx, conversation, restart, {
+						telegramQueue: conversation.service === "telegram",
+					}),
 				);
-				lines.push(spawnTelegramAccountTmux(ctx, accountId, account as TelegramAccountConfig, conversations, restart));
 			}
 			ctx.ui.notify(`${lines.join("\n")}\n\nAttach with: tmux attach -t <session>`, "info");
 		},
@@ -1719,13 +1369,6 @@ export default function (pi: ExtensionAPI) {
 			let spec = args.trim();
 			if (!spec) {
 				const configured = listConfiguredConversations(config);
-				const telegramAccounts = Object.entries(config.accounts)
-					.filter(([, account]) => account.service === "telegram")
-					.map(([accountId, account]) => ({
-						value: accountId,
-						label: `${account.name ?? accountId} / Telegram account`,
-						description: accountId,
-					}));
 				if (configured.length === 0) {
 					ctx.ui.notify(`No configured channels. Run /chat-config. (${CHAT_CONFIG_PATH})`, "warning");
 					return;
@@ -1734,22 +1377,13 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("Usage: /chat-connect <account/channel>", "warning");
 					return;
 				}
-				const items = [
-					...telegramAccounts,
-					...configured.map((item) => ({
-						value: item.conversationId,
-						label: item.conversationName,
-						description:
-							item.service === "telegram" ? `${item.conversationId} (same account worker)` : item.conversationId,
-					})),
-				];
+				const items = configured.map((item) => ({
+					value: item.conversationId,
+					label: item.conversationName,
+					description: item.conversationId,
+				}));
 				spec = (await selectItem(ctx, "Connect pi-chat channel", items)) || "";
 				if (!spec) return;
-			}
-			const account = config.accounts[spec];
-			if (account?.service === "telegram") {
-				await connectTelegramAccount(ctx, spec, true);
-				return;
 			}
 			await connectConversation(ctx, spec, true);
 		},
@@ -1759,12 +1393,10 @@ export default function (pi: ExtensionAPI) {
 		description: "Start a new pi session and keep the current pi-chat connection",
 		handler: async (_args, ctx) => {
 			const conversationId = runtime?.conversation.conversationId;
-			const accountId = telegramAccountWorker?.accountId;
 			const result = await ctx.newSession({
 				parentSession: ctx.sessionManager.getSessionFile(),
 				setup: async (sm) => {
-					if (accountId) sm.appendCustomEntry(SESSION_STATE_CUSTOM_TYPE, { accountId });
-					else if (conversationId) sm.appendCustomEntry(SESSION_STATE_CUSTOM_TYPE, { conversationId });
+					if (conversationId) sm.appendCustomEntry(SESSION_STATE_CUSTOM_TYPE, { conversationId });
 				},
 			});
 			if (!result.cancelled) return;
@@ -1831,21 +1463,17 @@ export default function (pi: ExtensionAPI) {
 			"chat_workers",
 		]);
 		updateStatus(ctx);
-		const flaggedAccountId = pi.getFlag(CHAT_ACCOUNT_FLAG);
-		const flaggedConversationId = pi.getFlag(CHAT_CONVERSATION_FLAG);
-		const persistedState = getPersistedChatState(ctx);
-		const accountId =
-			typeof flaggedAccountId === "string" && flaggedAccountId.trim()
-				? flaggedAccountId.trim()
-				: persistedState.accountId;
-		if (accountId) {
-			await connectTelegramAccount(ctx, accountId, false);
+		const flaggedDispatcherAccountId = pi.getFlag(CHAT_TELEGRAM_DISPATCHER_FLAG);
+		if (typeof flaggedDispatcherAccountId === "string" && flaggedDispatcherAccountId.trim()) {
+			await connectTelegramDispatcherProcess(ctx, flaggedDispatcherAccountId.trim());
 			return;
 		}
+		const flaggedConversationId = pi.getFlag(CHAT_CONVERSATION_FLAG);
+		const persistedConversationId = getPersistedConversationId(ctx);
 		const conversationId =
 			typeof flaggedConversationId === "string" && flaggedConversationId.trim()
 				? flaggedConversationId.trim()
-				: persistedState.conversationId;
+				: persistedConversationId;
 		if (conversationId) await connectConversation(ctx, conversationId, false);
 	});
 
@@ -1901,7 +1529,6 @@ export default function (pi: ExtensionAPI) {
 			stopTypingLoop();
 			chatTurnInFlight = false;
 			await runtime.failActiveJob("aborted");
-			await closeInactiveClosingSessions(ctx);
 			const action = pendingControlAction;
 			pendingControlAction = undefined;
 			if (action) {
@@ -1926,7 +1553,6 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 			ctx.ui.notify(errorMessage, "error");
-			await closeInactiveClosingSessions(ctx);
 			updateStatus(ctx, errorMessage);
 			await tryDispatch(ctx);
 			return;
@@ -1948,13 +1574,11 @@ export default function (pi: ExtensionAPI) {
 				chatTurnInFlight = false;
 				if (error instanceof Error && error.name === "AbortError") {
 					await runtime.failActiveJob("aborted");
-					await closeInactiveClosingSessions(ctx);
 					updateStatus(ctx);
 					await tryDispatch(ctx);
 					return;
 				}
 				await runtime.failActiveJob(`send failed: ${message}`);
-				await closeInactiveClosingSessions(ctx);
 				updateStatus(ctx, message);
 				await tryDispatch(ctx);
 				return;
@@ -1962,7 +1586,6 @@ export default function (pi: ExtensionAPI) {
 		}
 		chatTurnInFlight = false;
 		await runtime.completeActiveJob(finalText, remoteMessageId, attachmentPaths);
-		await closeInactiveClosingSessions(ctx);
 		updateStatus(ctx);
 		await tryDispatch(ctx);
 	});
