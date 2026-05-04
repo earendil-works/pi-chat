@@ -1,6 +1,6 @@
 # pi-chat
 
-A pi extension that bridges Discord and Telegram channels to a sandboxed pi session. Each connected channel gets its own [Gondolin](https://github.com/earendil-works/gondolin) micro-VM with persistent workspace, shared storage, memory, and skills.
+A pi extension that bridges Discord and Telegram channels to sandboxed pi sessions. Each connected channel gets its own [Gondolin](https://github.com/earendil-works/gondolin) micro-VM with persistent workspace, shared storage, memory, and skills. Telegram workers listen once per bot account and dispatch updates to the configured DMs/groups for that account.
 
 ## Quick Start
 
@@ -29,7 +29,7 @@ pi -e /path/to/pi-chat
 ## Features
 
 - **Discord server channels** and **Telegram DMs/groups**
-- **Gondolin VM sandbox** per connection — tools run inside an isolated Alpine Linux micro-VM
+- **Gondolin VM sandbox** per connected channel — tools run inside an isolated Alpine Linux micro-VM
 - **Persistent workspace** and **shared storage** across sessions
 - **Streamed preview** responses with edit-in-place
 - **Reply-to-trigger** — bot replies are attached to the triggering message
@@ -67,18 +67,18 @@ pi -e /path/to/pi-chat
 | Command | Description |
 |---------|-------------|
 | `/chat-config` | Configure accounts, channels, and secrets |
-| `/chat-connect` | Connect to a configured channel |
+| `/chat-connect` | Connect to a configured channel, or a Telegram account dispatcher |
 | `/chat-disconnect` | Disconnect the current channel |
 | `/chat-status` | Show connection status, model, usage, context |
 | `/chat-list` | List configured channels |
-| `/chat-spawn-all` | Spawn every configured channel in detached tmux/pi sessions |
+| `/chat-spawn-all` | Spawn Discord channel workers and Telegram account dispatchers in detached tmux/pi sessions |
 | `/chat-spawn-all --restart` | Restart those tmux/pi sessions |
 | `/chat-workers` | Show managed tmux/pi worker status |
 | `/chat-open-all` | Open running workers in a tiled tmux dashboard |
 | `/chat-kill-all` | Kill all managed tmux/pi workers |
 | `/chat-new` | Start a new pi session, keeping the chat connection |
 
-Workers also write status snapshots every 15 seconds under `~/.pi/agent/chat/worker-status/`. The `chat_workers` tool exposes the same status to an orchestrating pi agent.
+Workers also write per-channel status snapshots every 15 seconds under `~/.pi/agent/chat/worker-status/`. Telegram account dispatchers write one snapshot per configured DM/group while sharing one polling loop for the bot token.
 
 ---
 
@@ -124,7 +124,7 @@ Everything lives under `~/.pi/agent/chat/`:
 
 ## VM Environment
 
-Each connection starts a Gondolin micro-VM with:
+Each connected channel starts a Gondolin micro-VM with:
 
 - **Alpine Linux** with bash pre-installed
 - `/workspace` → channel workspace directory

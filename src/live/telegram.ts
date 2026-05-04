@@ -171,15 +171,28 @@ async function messageToInput(
 	};
 }
 
-export async function connectTelegramLive(
+function mergeMediaGroup(updates: TelegramUpdate[]): TelegramMessage | undefined {
+	const messages = updates
+		.map((update) => update.message || update.edited_message)
+		.filter(Boolean) as TelegramMessage[];
+	if (messages.length === 0) return undefined;
+	const merged = { ...messages[0] } as TelegramMessage;
+	for (const message of messages.slice(1)) {
+		if (!merged.text && message.text) merged.text = message.text;
+		if (!merged.caption && message.caption) merged.caption = message.caption;
+		if (message.photo?.length) merged.photo = [...(merged.photo ?? []), ...message.photo];
+		if (!merged.document && message.document) merged.document = message.document;
+		if (!merged.video && message.video) merged.video = message.video;
+		if (!merged.audio && message.audio) merged.audio = message.audio;
+	}
+	return merged;
+}
+
+function createTelegramConversationConnection(
 	conversation: ResolvedConversation,
-	handlers: LiveConnectionHandlers,
-	resumeState?: ResumeState,
-): Promise<LiveConnection> {
-	const account = conversation.account as TelegramAccountConfig;
-	let abort = false;
-	let offset = resumeState?.cursor ? Number(resumeState.cursor) + 1 : 0;
-	const pollController = new AbortController();
+	account: TelegramAccountConfig,
+	disconnect: () => Promise<void> = async () => undefined,
+): LiveConnection {
 	const preview = new StreamingPreview(conversation.service, {
 		create: async (text, parseMode, replyToMessageId) =>
 			String(
@@ -212,110 +225,9 @@ export async function connectTelegramLive(
 			});
 		},
 	});
-	const mediaGroups = new Map<string, { updates: TelegramUpdate[]; timer?: ReturnType<typeof setTimeout> }>();
-	const mergeMediaGroup = (updates: TelegramUpdate[]): TelegramMessage | undefined => {
-		const messages = updates
-			.map((update) => update.message || update.edited_message)
-			.filter(Boolean) as TelegramMessage[];
-		if (messages.length === 0) return undefined;
-		const merged = { ...messages[0] } as TelegramMessage;
-		for (const message of messages.slice(1)) {
-			if (!merged.text && message.text) merged.text = message.text;
-			if (!merged.caption && message.caption) merged.caption = message.caption;
-			if (message.photo?.length) merged.photo = [...(merged.photo ?? []), ...message.photo];
-			if (!merged.document && message.document) merged.document = message.document;
-			if (!merged.video && message.video) merged.video = message.video;
-			if (!merged.audio && message.audio) merged.audio = message.audio;
-		}
-		return merged;
-	};
-	const flushMediaGroup = async (key: string): Promise<void> => {
-		const state = mediaGroups.get(key);
-		mediaGroups.delete(key);
-		if (!state) return;
-		const merged = mergeMediaGroup(state.updates);
-		if (!merged) return;
-		const input = await messageToInput(conversation, account, merged);
-		if (!input) return;
-		const lastUpdateId = state.updates.at(-1)?.update_id;
-		await handlers.onMessage(input, {
-			cursor: lastUpdateId !== undefined ? String(lastUpdateId) : undefined,
-			messageId: input.messageId,
-		});
-	};
-	const processInitialUpdates = async (updates: TelegramUpdate[]): Promise<void> => {
-		const grouped = new Map<string, TelegramUpdate[]>();
-		for (const update of updates) {
-			offset = update.update_id + 1;
-			const message = update.message || update.edited_message;
-			if (!message) continue;
-			if (!message.media_group_id) {
-				const input = await messageToInput(conversation, account, message);
-				if (input) await handlers.onMessage(input, { cursor: String(update.update_id), messageId: input.messageId });
-				continue;
-			}
-			const key = `${message.chat.id}:${message.media_group_id}`;
-			grouped.set(key, [...(grouped.get(key) ?? []), update]);
-		}
-		for (const updates of grouped.values()) {
-			const merged = mergeMediaGroup(updates);
-			if (!merged) continue;
-			const input = await messageToInput(conversation, account, merged);
-			if (!input) continue;
-			await handlers.onMessage(input, {
-				cursor: String(updates.at(-1)?.update_id ?? 0),
-				messageId: input.messageId,
-			});
-		}
-	};
-	const initialUpdates = await callTelegram<TelegramUpdate[]>(account.botToken, "getUpdates", {
-		offset: offset > 0 ? offset : undefined,
-		timeout: 0,
-		allowed_updates: ["message", "edited_message"],
-	});
-	await processInitialUpdates(initialUpdates);
-	await handlers.onCaughtUp();
-	const loop = (async () => {
-		while (!abort) {
-			try {
-				const updates = await callTelegram<TelegramUpdate[]>(
-					account.botToken,
-					"getUpdates",
-					{ offset: offset > 0 ? offset : undefined, timeout: 30, allowed_updates: ["message", "edited_message"] },
-					{ signal: pollController.signal },
-				);
-				for (const update of updates) {
-					offset = update.update_id + 1;
-					const message = update.message || update.edited_message;
-					if (!message) continue;
-					if (message.media_group_id) {
-						const key = `${message.chat.id}:${message.media_group_id}`;
-						const existing = mediaGroups.get(key) ?? { updates: [] };
-						existing.updates.push(update);
-						if (existing.timer) clearTimeout(existing.timer);
-						existing.timer = setTimeout(() => void flushMediaGroup(key), 1200);
-						mediaGroups.set(key, existing);
-						continue;
-					}
-					const input = await messageToInput(conversation, account, message);
-					if (input) await handlers.onMessage(input, { cursor: String(update.update_id), messageId: input.messageId });
-				}
-			} catch (error) {
-				if (abort) break;
-				if (error instanceof DOMException && error.name === "AbortError") break;
-				await handlers.onError(error instanceof Error ? error : new Error(String(error)));
-				await new Promise((resolve) => setTimeout(resolve, 3000));
-			}
-		}
-	})();
 	return {
 		conversation,
-		disconnect: async () => {
-			abort = true;
-			pollController.abort();
-			for (const state of mediaGroups.values()) if (state.timer) clearTimeout(state.timer);
-			await loop.catch(() => undefined);
-		},
+		disconnect,
 		sendImmediate: async (text, replyToMessageId) =>
 			String(
 				(
@@ -400,5 +312,256 @@ export async function connectTelegramLive(
 		syncPreview: async (markdown, done = false) => preview.update(markdown, done),
 		clearPreview: async () => preview.clear(),
 		setReplyTo: (messageId) => preview.setReplyTo(messageId),
+	};
+}
+
+export async function connectTelegramLive(
+	conversation: ResolvedConversation,
+	handlers: LiveConnectionHandlers,
+	resumeState?: ResumeState,
+): Promise<LiveConnection> {
+	const account = conversation.account as TelegramAccountConfig;
+	let abort = false;
+	let offset = resumeState?.cursor ? Number(resumeState.cursor) + 1 : 0;
+	const pollController = new AbortController();
+	const mediaGroups = new Map<string, { updates: TelegramUpdate[]; timer?: ReturnType<typeof setTimeout> }>();
+	const flushMediaGroup = async (key: string): Promise<void> => {
+		const state = mediaGroups.get(key);
+		mediaGroups.delete(key);
+		if (!state) return;
+		const merged = mergeMediaGroup(state.updates);
+		if (!merged) return;
+		const input = await messageToInput(conversation, account, merged);
+		if (!input) return;
+		const lastUpdateId = state.updates.at(-1)?.update_id;
+		await handlers.onMessage(input, {
+			cursor: lastUpdateId !== undefined ? String(lastUpdateId) : undefined,
+			messageId: input.messageId,
+		});
+	};
+	const processInitialUpdates = async (updates: TelegramUpdate[]): Promise<void> => {
+		const grouped = new Map<string, TelegramUpdate[]>();
+		for (const update of updates) {
+			offset = update.update_id + 1;
+			const message = update.message || update.edited_message;
+			if (!message) continue;
+			if (!message.media_group_id) {
+				const input = await messageToInput(conversation, account, message);
+				if (input) await handlers.onMessage(input, { cursor: String(update.update_id), messageId: input.messageId });
+				continue;
+			}
+			const key = `${message.chat.id}:${message.media_group_id}`;
+			grouped.set(key, [...(grouped.get(key) ?? []), update]);
+		}
+		for (const updates of grouped.values()) {
+			const merged = mergeMediaGroup(updates);
+			if (!merged) continue;
+			const input = await messageToInput(conversation, account, merged);
+			if (!input) continue;
+			await handlers.onMessage(input, {
+				cursor: String(updates.at(-1)?.update_id ?? 0),
+				messageId: input.messageId,
+			});
+		}
+	};
+	const initialUpdates = await callTelegram<TelegramUpdate[]>(account.botToken, "getUpdates", {
+		offset: offset > 0 ? offset : undefined,
+		timeout: 0,
+		allowed_updates: ["message", "edited_message"],
+	});
+	await processInitialUpdates(initialUpdates);
+	await handlers.onCaughtUp();
+	const loop = (async () => {
+		while (!abort) {
+			try {
+				const updates = await callTelegram<TelegramUpdate[]>(
+					account.botToken,
+					"getUpdates",
+					{ offset: offset > 0 ? offset : undefined, timeout: 30, allowed_updates: ["message", "edited_message"] },
+					{ signal: pollController.signal },
+				);
+				for (const update of updates) {
+					offset = update.update_id + 1;
+					const message = update.message || update.edited_message;
+					if (!message) continue;
+					if (message.media_group_id) {
+						const key = `${message.chat.id}:${message.media_group_id}`;
+						const existing = mediaGroups.get(key) ?? { updates: [] };
+						existing.updates.push(update);
+						if (existing.timer) clearTimeout(existing.timer);
+						existing.timer = setTimeout(() => void flushMediaGroup(key), 1200);
+						mediaGroups.set(key, existing);
+						continue;
+					}
+					const input = await messageToInput(conversation, account, message);
+					if (input) await handlers.onMessage(input, { cursor: String(update.update_id), messageId: input.messageId });
+				}
+			} catch (error) {
+				if (abort) break;
+				if (error instanceof DOMException && error.name === "AbortError") break;
+				await handlers.onError(error instanceof Error ? error : new Error(String(error)));
+				await new Promise((resolve) => setTimeout(resolve, 3000));
+			}
+		}
+	})();
+	return createTelegramConversationConnection(conversation, account, async () => {
+		abort = true;
+		pollController.abort();
+		for (const state of mediaGroups.values()) if (state.timer) clearTimeout(state.timer);
+		await loop.catch(() => undefined);
+	});
+}
+
+export interface TelegramAccountLiveHandlers {
+	onMessage(
+		conversation: ResolvedConversation,
+		input: InboundMessageInput,
+		checkpoint?: { cursor?: string; messageId?: string },
+	): Promise<void>;
+	onCaughtUp(): Promise<void>;
+	onCursor(cursor: string): Promise<void>;
+	onError(error: Error): Promise<void>;
+}
+
+export interface TelegramAccountLiveConnection {
+	accountId: string;
+	disconnect(): Promise<void>;
+	updateConversations(conversations: ResolvedConversation[]): void;
+	createConversationConnection(conversation: ResolvedConversation): LiveConnection;
+}
+
+function buildConversationChatMap(conversations: ResolvedConversation[]): Map<string, ResolvedConversation> {
+	return new Map(conversations.map((conversation) => [conversation.channel.id, conversation]));
+}
+
+export async function connectTelegramAccountLive(
+	accountId: string,
+	account: TelegramAccountConfig,
+	conversations: ResolvedConversation[],
+	handlers: TelegramAccountLiveHandlers,
+	resumeCursor?: string,
+): Promise<TelegramAccountLiveConnection> {
+	let abort = false;
+	let offset = resumeCursor ? Number(resumeCursor) + 1 : 0;
+	let conversationsByChatId = buildConversationChatMap(conversations);
+	const pollController = new AbortController();
+	const mediaGroups = new Map<string, { updates: TelegramUpdate[]; timer?: ReturnType<typeof setTimeout> }>();
+	const noteCursor = async (update: TelegramUpdate): Promise<void> => {
+		offset = update.update_id + 1;
+		await handlers.onCursor(String(update.update_id));
+	};
+	const flushMediaGroup = async (key: string): Promise<void> => {
+		const state = mediaGroups.get(key);
+		mediaGroups.delete(key);
+		if (!state) return;
+		const merged = mergeMediaGroup(state.updates);
+		if (!merged) return;
+		const conversation = conversationsByChatId.get(String(merged.chat.id));
+		if (!conversation) return;
+		const input = await messageToInput(conversation, account, merged);
+		if (!input) return;
+		const lastUpdateId = state.updates.at(-1)?.update_id;
+		await handlers.onMessage(conversation, input, {
+			cursor: lastUpdateId !== undefined ? String(lastUpdateId) : undefined,
+			messageId: input.messageId,
+		});
+	};
+	const processInitialUpdates = async (updates: TelegramUpdate[]): Promise<void> => {
+		const grouped = new Map<string, TelegramUpdate[]>();
+		for (const update of updates) {
+			await noteCursor(update);
+			const message = update.message || update.edited_message;
+			if (!message) continue;
+			const conversation = conversationsByChatId.get(String(message.chat.id));
+			if (!conversation) continue;
+			if (!message.media_group_id) {
+				const input = await messageToInput(conversation, account, message);
+				if (input)
+					await handlers.onMessage(conversation, input, {
+						cursor: String(update.update_id),
+						messageId: input.messageId,
+					});
+				continue;
+			}
+			const key = `${message.chat.id}:${message.media_group_id}`;
+			grouped.set(key, [...(grouped.get(key) ?? []), update]);
+		}
+		for (const updates of grouped.values()) {
+			const merged = mergeMediaGroup(updates);
+			if (!merged) continue;
+			const conversation = conversationsByChatId.get(String(merged.chat.id));
+			if (!conversation) continue;
+			const input = await messageToInput(conversation, account, merged);
+			if (!input) continue;
+			await handlers.onMessage(conversation, input, {
+				cursor: String(updates.at(-1)?.update_id ?? 0),
+				messageId: input.messageId,
+			});
+		}
+	};
+	const initialUpdates = await callTelegram<TelegramUpdate[]>(account.botToken, "getUpdates", {
+		offset: offset > 0 ? offset : undefined,
+		timeout: 0,
+		allowed_updates: ["message", "edited_message"],
+	});
+	await processInitialUpdates(initialUpdates);
+	await handlers.onCaughtUp();
+	const loop = (async () => {
+		while (!abort) {
+			try {
+				const updates = await callTelegram<TelegramUpdate[]>(
+					account.botToken,
+					"getUpdates",
+					{ offset: offset > 0 ? offset : undefined, timeout: 30, allowed_updates: ["message", "edited_message"] },
+					{ signal: pollController.signal },
+				);
+				for (const update of updates) {
+					await noteCursor(update);
+					const message = update.message || update.edited_message;
+					if (!message) continue;
+					const conversation = conversationsByChatId.get(String(message.chat.id));
+					if (!conversation) continue;
+					if (message.media_group_id) {
+						const key = `${message.chat.id}:${message.media_group_id}`;
+						const existing = mediaGroups.get(key) ?? { updates: [] };
+						existing.updates.push(update);
+						if (existing.timer) clearTimeout(existing.timer);
+						existing.timer = setTimeout(() => void flushMediaGroup(key), 1200);
+						mediaGroups.set(key, existing);
+						continue;
+					}
+					const input = await messageToInput(conversation, account, message);
+					if (input)
+						await handlers.onMessage(conversation, input, {
+							cursor: String(update.update_id),
+							messageId: input.messageId,
+						});
+				}
+			} catch (error) {
+				if (abort) break;
+				if (error instanceof DOMException && error.name === "AbortError") break;
+				await handlers.onError(error instanceof Error ? error : new Error(String(error)));
+				await new Promise((resolve) => setTimeout(resolve, 3000));
+			}
+		}
+	})();
+	return {
+		accountId,
+		disconnect: async () => {
+			abort = true;
+			pollController.abort();
+			for (const state of mediaGroups.values()) if (state.timer) clearTimeout(state.timer);
+			await loop.catch(() => undefined);
+		},
+		updateConversations: (nextConversations) => {
+			conversationsByChatId = buildConversationChatMap(nextConversations);
+			for (const [key, state] of mediaGroups) {
+				const message = state.updates[0]?.message || state.updates[0]?.edited_message;
+				if (message && conversationsByChatId.has(String(message.chat.id))) continue;
+				if (state.timer) clearTimeout(state.timer);
+				mediaGroups.delete(key);
+			}
+		},
+		createConversationConnection: (conversation) => createTelegramConversationConnection(conversation, account),
 	};
 }
