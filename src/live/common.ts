@@ -1,4 +1,4 @@
-import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import type { ResolvedConversation } from "../core/config-types.js";
 import type { AttachmentInput } from "../core/runtime-types.js";
@@ -39,34 +39,6 @@ export function guessAttachmentKind(fileName: string, mimeType?: string): "image
 	if ([".mp3", ".wav", ".ogg", ".m4a"].includes(ext)) return "audio";
 	if ([".mp4", ".mov", ".webm"].includes(ext)) return "video";
 	return "file";
-}
-
-export function guessMimeType(fileName: string): string | undefined {
-	const ext = extname(fileName).toLowerCase();
-	if (ext === ".png") return "image/png";
-	if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
-	if (ext === ".gif") return "image/gif";
-	if (ext === ".webp") return "image/webp";
-	if (ext === ".mp3") return "audio/mpeg";
-	if (ext === ".wav") return "audio/wav";
-	if (ext === ".ogg") return "audio/ogg";
-	if (ext === ".m4a") return "audio/mp4";
-	if (ext === ".mp4") return "video/mp4";
-	if (ext === ".mov") return "video/quicktime";
-	if (ext === ".webm") return "video/webm";
-	if (ext === ".pdf") return "application/pdf";
-	if (ext === ".json") return "application/json";
-	if (ext === ".md") return "text/markdown";
-	if (ext === ".txt" || ext === ".log") return "text/plain";
-	return undefined;
-}
-
-export async function readLocalAttachment(
-	path: string,
-): Promise<{ name: string; data: Uint8Array; mimeType?: string }> {
-	const fileStats = await lstat(path);
-	if (!fileStats.isFile()) throw new Error(`Attachment is not a regular file: ${path}`);
-	return { name: basename(path), data: new Uint8Array(await readFile(path)), mimeType: guessMimeType(path) };
 }
 
 export async function fetchBinary(url: string, headers?: HeadersInit): Promise<Uint8Array> {

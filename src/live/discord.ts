@@ -5,11 +5,11 @@ import { once } from "node:events";
 import { Client, Events, GatewayIntentBits, type Message, Partials } from "discord.js";
 
 import type { DiscordAccountConfig, ResolvedConversation } from "../core/config-types.js";
-import type { InboundMessageInput } from "../core/runtime-types.js";
+import type { InboundMessageInput, OutboundAttachment } from "../core/runtime-types.js";
 import { chunkText } from "../render/chunking.js";
 import { formatMarkdownForService, maxMessageLength } from "../render/format.js";
 import { StreamingPreview } from "../render/streaming.js";
-import { readLocalAttachment, storeDownloadedAttachment, textMentionsBot } from "./common.js";
+import { storeDownloadedAttachment, textMentionsBot } from "./common.js";
 import type { LiveConnection, LiveConnectionHandlers } from "./types.js";
 
 async function withReadyClient(token: string): Promise<Client<true>> {
@@ -120,7 +120,7 @@ async function sendDiscordMessage(
 	botToken: string,
 	channelId: string,
 	content: string,
-	attachmentPaths: string[] = [],
+	attachments: OutboundAttachment[] = [],
 	signal?: AbortSignal,
 	replyToMessageId?: string,
 ): Promise<string> {
@@ -131,11 +131,10 @@ async function sendDiscordMessage(
 	for (let i = 0; i < chunks.length; i++) {
 		const payload: Record<string, unknown> = { content: chunks[i] };
 		if (i === 0 && replyToMessageId) payload.message_reference = { message_id: replyToMessageId };
-		if (i === chunks.length - 1 && attachmentPaths.length > 0) {
+		if (i === chunks.length - 1 && attachments.length > 0) {
 			const form = new FormData();
 			form.set("payload_json", JSON.stringify(payload));
-			for (const [index, path] of attachmentPaths.entries()) {
-				const file = await readLocalAttachment(path);
+			for (const [index, file] of attachments.entries()) {
 				form.set(`files[${index}]`, new Blob([Buffer.from(file.data)], { type: file.mimeType }), file.name);
 			}
 			const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
@@ -241,8 +240,8 @@ export async function connectDiscordLive(
 		sendImmediate: async (text, replyToMessageId) => {
 			return sendDiscordMessage(account.botToken, conversation.channel.id, text, [], undefined, replyToMessageId);
 		},
-		send: async (text, attachmentPaths = [], signal, replyToMessageId) =>
-			sendDiscordMessage(account.botToken, conversation.channel.id, text, attachmentPaths, signal, replyToMessageId),
+		send: async (text, attachments = [], signal, replyToMessageId) =>
+			sendDiscordMessage(account.botToken, conversation.channel.id, text, attachments, signal, replyToMessageId),
 		startTyping: async () => {
 			const channel = await resolveTextChannel(client, conversation);
 			await channel.sendTyping();
