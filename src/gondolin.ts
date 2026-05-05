@@ -124,22 +124,18 @@ export class ConversationSandbox {
 		if (vm) await vm.close();
 	}
 
-	private resolveAnyGuestPath(inputPath: string): string {
+	private resolveGuestPath(inputPath: string): string {
 		const trimmed = inputPath.trim();
 		if (!trimmed) throw new Error("Path must not be empty");
 		const base = trimmed.startsWith("/") ? "/" : GONDOLIN_WORKSPACE;
-		return path.posix.resolve(base, trimmed);
-	}
-
-	private resolveGuestPath(inputPath: string): string {
-		const guestPath = this.resolveAnyGuestPath(inputPath);
+		const guestPath = path.posix.resolve(base, trimmed);
 		if (!guestMountRoot(guestPath)) throw new Error(`Path is outside mounted storage: ${inputPath}`);
 		return guestPath;
 	}
 
 	async readAttachment(inputPath: string): Promise<OutboundAttachment> {
 		const vm = await this.start();
-		const guestPath = this.resolveAnyGuestPath(inputPath);
+		const guestPath = this.resolveGuestPath(inputPath);
 		const fileStats = await vm.fs.stat(guestPath);
 		if (!fileStats.isFile()) throw new Error(`Not a file: ${inputPath}`);
 		const name = path.posix.basename(guestPath).replace(/[^a-zA-Z0-9._-]+/g, "_") || "attachment";
