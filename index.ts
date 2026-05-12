@@ -244,8 +244,13 @@ function formatChatSkillsForPrompt(skills: ChatPromptSkill[]): string {
 const HOST_SKILLS_BLOCK_RE =
 	/\n\nThe following skills provide specialized instructions for specific tasks\.\nUse the read tool to load a skill's file when the task matches its description\.\nWhen a skill file references a relative path[\s\S]*?<\/available_skills>/;
 
-function stripHostSkillsBlock(prompt: string): string {
-	return prompt.replace(HOST_SKILLS_BLOCK_RE, "");
+function adaptSystemPromptForSandbox(prompt: string): string {
+	return prompt
+		.replace(
+			`Current working directory: ${process.cwd()}`,
+			`Current working directory: ${GONDOLIN_WORKSPACE} (Gondolin VM; shared files at ${GONDOLIN_SHARED})`,
+		)
+		.replace(HOST_SKILLS_BLOCK_RE, "");
 }
 
 function tmuxSafeName(value: string): string {
@@ -1380,14 +1385,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (event) => {
-		const systemPrompt = sandbox
-			? stripHostSkillsBlock(
-					event.systemPrompt.replace(
-						`Current working directory: ${process.cwd()}`,
-						`Current working directory: ${GONDOLIN_WORKSPACE} (Gondolin VM; shared files at ${GONDOLIN_SHARED})`,
-					),
-				)
-			: event.systemPrompt;
+		const systemPrompt = sandbox ? adaptSystemPromptForSandbox(event.systemPrompt) : event.systemPrompt;
 		if (!pendingChatDispatch) return sandbox ? { systemPrompt } : undefined;
 		pendingChatDispatch = false;
 		const channelName = runtime?.conversation.channel.name ?? runtime?.conversation.channelKey ?? "chat";
