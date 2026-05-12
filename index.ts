@@ -237,6 +237,17 @@ function formatChatSkillsForPrompt(skills: ChatPromptSkill[]): string {
 	return lines.join("\n");
 }
 
+// Matches the <available_skills> block that pi core injects into the system prompt from
+// the host's skills directories. In sandbox mode those host paths are unreachable inside
+// the Gondolin VM, so we strip the entire block (preamble + tags) and let pi-chat's own
+// buildSkillsPromptSuffix re-emit a VM-aware block with guest paths.
+const HOST_SKILLS_BLOCK_RE =
+	/\n\nThe following skills provide specialized instructions for specific tasks\.\nUse the read tool to load a skill's file when the task matches its description\.\nWhen a skill file references a relative path[\s\S]*?<\/available_skills>/;
+
+function stripHostSkillsBlock(prompt: string): string {
+	return prompt.replace(HOST_SKILLS_BLOCK_RE, "");
+}
+
 function tmuxSafeName(value: string): string {
 	const safe = value.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "") || "channel";
 	return `${WORKER_TMUX_PREFIX}${safe}`.slice(0, 100);
@@ -1370,9 +1381,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event) => {
 		const systemPrompt = sandbox
-			? event.systemPrompt.replace(
-					`Current working directory: ${process.cwd()}`,
-					`Current working directory: ${GONDOLIN_WORKSPACE} (Gondolin VM; shared files at ${GONDOLIN_SHARED})`,
+			? stripHostSkillsBlock(
+					event.systemPrompt.replace(
+						`Current working directory: ${process.cwd()}`,
+						`Current working directory: ${GONDOLIN_WORKSPACE} (Gondolin VM; shared files at ${GONDOLIN_SHARED})`,
+					),
 				)
 			: event.systemPrompt;
 		if (!pendingChatDispatch) return sandbox ? { systemPrompt } : undefined;
