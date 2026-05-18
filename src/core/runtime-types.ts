@@ -109,6 +109,8 @@ export interface DispatchableJob {
 	prompt: string;
 	triggerMessageId?: string;
 	triggerUserId?: string;
+	triggerText?: string;
+	attachments?: StoredAttachment[];
 }
 
 export interface ChatHistoryQuery {

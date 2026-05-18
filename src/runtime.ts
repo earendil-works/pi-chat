@@ -40,6 +40,7 @@ function toGuestDisplayPath(conversation: ResolvedConversation, localPath: strin
 }
 
 function formatTranscriptRecord(conversation: ResolvedConversation, record: ChatLogRecord): string[] {
+	if (record.type === "outbound") return [`- [${record.timestamp}] Baldy: ${record.text || "(no text)"}`];
 	if (record.type !== "inbound") return [];
 	const lines = [
 		`- [${record.timestamp}] [uid:${record.userId}] ${record.userName ?? "unknown"}: ${record.text || "(no text)"}`,
@@ -261,18 +262,47 @@ export class ConversationRuntime {
 		if (!job) return undefined;
 		this.activeJob = job;
 		const triggerRecord = getLatestTriggerRecord(this.records, job);
-		return { job, prompt: this.buildPrompt(job), triggerMessageId: triggerRecord?.messageId, triggerUserId: triggerRecord?.userId };
+		return {
+			job,
+			prompt: this.buildPrompt(job),
+			triggerMessageId: triggerRecord?.messageId,
+			triggerUserId: triggerRecord?.userId,
+			triggerText: triggerRecord?.text,
+			attachments: triggerRecord?.attachments,
+		};
 	}
 
 	private buildPrompt(job: PendingJob): string {
+		if (this.conversation.channel.mode === "mirror") {
+			const completedBoundary = this.getLastCompletedTriggerRecordId();
+			const slice = this.records.filter(
+				(record) =>
+					record.recordId > completedBoundary && record.recordId <= job.triggerRecordId && record.type === "inbound",
+			);
+			const last = slice[slice.length - 1];
+			if (!last) return "";
+			return formatTranscriptRecord(this.conversation, last).join("\n").trim();
+		}
 		const completedBoundary = this.getLastCompletedTriggerRecordId();
+		const recentHistory = this.records
+			.filter(
+				(record) => record.recordId <= completedBoundary && (record.type === "inbound" || record.type === "outbound"),
+			)
+			.slice(-16);
 		const slice = this.records.filter(
 			(record) =>
 				record.recordId > completedBoundary && record.recordId <= job.triggerRecordId && record.type === "inbound",
 		);
+		const sections: string[] = [];
+		if (recentHistory.length > 0) {
+			const historyLines: string[] = [];
+			for (const record of recentHistory) historyLines.push(...formatTranscriptRecord(this.conversation, record));
+			sections.push(`Recent conversation history for context only:\n${historyLines.join("\n")}`);
+		}
 		const lines: string[] = [];
 		for (const record of slice) lines.push(...formatTranscriptRecord(this.conversation, record));
-		return lines.join("\n").trim();
+		sections.push(`New messages to answer:\n${lines.join("\n").trim()}`);
+		return sections.join("\n\n").trim();
 	}
 
 	async completeActiveJob(text: string, remoteMessageId?: string, attachmentPaths?: string[]): Promise<void> {

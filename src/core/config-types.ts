@@ -15,13 +15,23 @@ export interface GondolinSecretConfig {
 }
 
 export interface GondolinConfig {
+	/** Named groups of secrets. Defined at global or account level; referenced by channel activePresets. */
+	presets?: Record<string, Record<string, GondolinSecretConfig>>;
 	secrets?: Record<string, GondolinSecretConfig>;
+	/** Channel-level: preset names from global/account gondolin to activate for this channel. */
+	activePresets?: string[];
 }
+
+export type ChannelMode = "admin" | "community" | "mirror";
 
 export interface ConfiguredChannel {
 	id: string;
 	name?: string;
 	dm?: boolean;
+	/** Channel behavior mode. Defaults to "admin". */
+	mode?: ChannelMode;
+	/** When false, tools run directly on the host filesystem — no Gondolin VM sandbox. Defaults to true. */
+	sandbox?: boolean;
 	access?: AccessPolicy;
 	gondolin?: GondolinConfig;
 }

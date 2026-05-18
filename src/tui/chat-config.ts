@@ -9,6 +9,7 @@ import {
 } from "../config.js";
 import type {
 	AccessPolicy,
+	ChannelMode,
 	ChatAccountConfig,
 	ChatConfig,
 	DiscordAccountConfig,
@@ -24,8 +25,12 @@ import { selectItem, showNotice, toggleItems } from "./dialogs.js";
 import { createDiscordAccountWithGuidedSetup } from "./discord-setup.js";
 import { addTelegramObservedTargetToAccount, createTelegramAccountWithGuidedSetup } from "./telegram-setup.js";
 
+function serviceIcon(service: ChatAccountConfig["service"]): string {
+	return service === "discord" ? "💬" : "✈️";
+}
+
 function accountDescription(account: ChatAccountConfig, snapshot: DiscoverySnapshot | undefined): string {
-	const parts: string[] = [account.service];
+	const parts: string[] = [`${serviceIcon(account.service)} ${account.service}`];
 	if (account.name) parts.push(account.name);
 	if (account.service === "discord") parts.push(account.serverName);
 	else if (snapshot?.identity.userName) parts.push(`@${snapshot.identity.userName}`);
@@ -68,6 +73,33 @@ function defaultAccess(dm: boolean): AccessPolicy {
 function secretSummary(config: GondolinConfig | undefined): string {
 	const count = Object.keys(config?.secrets ?? {}).length;
 	return `${count} secret${count === 1 ? "" : "s"}`;
+}
+
+function presetSummary(config: GondolinConfig | undefined): string {
+	const count = Object.keys(config?.presets ?? {}).length;
+	return `${count} preset${count === 1 ? "" : "s"}`;
+}
+
+function modeLabel(mode: ChannelMode | undefined): string {
+	if (mode === "community") return "community — Baldy public assistant";
+	if (mode === "mirror") return "mirror — lightweight notification/response";
+	return "admin — full pi-chat";
+}
+
+function channelSummary(channel: {
+	dm?: boolean;
+	mode?: ChannelMode;
+	sandbox?: boolean;
+	gondolin?: GondolinConfig;
+}): string {
+	return [
+		channel.dm ? "DM" : "group",
+		channel.mode ?? "admin",
+		channel.sandbox === false ? "host tools" : "sandbox",
+		secretSummary(channel.gondolin),
+	]
+		.filter(Boolean)
+		.join(" • ");
 }
 
 function isValidEnvVarName(value: string): boolean {
@@ -160,24 +192,204 @@ async function configureSecrets(
 	}
 }
 
+async function configurePreset(
+	ctx: ExtensionContext,
+	presetName: string,
+	current: Record<string, GondolinSecretConfig>,
+): Promise<Record<string, GondolinSecretConfig> | undefined> {
+	let secrets = { ...current };
+	while (true) {
+		const choice = await selectItem(ctx, `${presetName} preset`, [
+			{ value: "__add__", label: "+ Add secret" },
+			...Object.entries(secrets)
+				.sort(([a], [b]) => a.localeCompare(b))
+				.map(([name, secret]) => ({ value: name, label: name, description: secret.hosts.join(", ") })),
+			{ value: "__save__", label: "Save" },
+			{ value: "__back__", label: "Back" },
+		]);
+		if (!choice || choice === "__back__") return undefined;
+		if (choice === "__save__") return secrets;
+		if (choice === "__add__") {
+			const draft = await promptSecretDraft(ctx);
+			if (!draft) continue;
+			secrets = { ...secrets, [draft.name]: draft.secret };
+			continue;
+		}
+		const existing = secrets[choice];
+		if (!existing) continue;
+		const action = await selectItem(ctx, choice, [
+			{ value: "edit", label: "Edit" },
+			{ value: "delete", label: "Delete" },
+			{ value: "back", label: "Back" },
+		]);
+		if (!action || action === "back") continue;
+		if (action === "delete") {
+			const next = { ...secrets };
+			delete next[choice];
+			secrets = next;
+			continue;
+		}
+		const draft = await promptSecretDraft(ctx, choice, existing);
+		if (!draft) continue;
+		const next = { ...secrets };
+		if (draft.name !== choice) delete next[choice];
+		next[draft.name] = draft.secret;
+		secrets = next;
+	}
+}
+
+async function configurePresets(
+	ctx: ExtensionContext,
+	title: string,
+	config: GondolinConfig | undefined,
+	onSave: (next: GondolinConfig | undefined) => Promise<void>,
+): Promise<void> {
+	let presets: Record<string, Record<string, GondolinSecretConfig>> = { ...(config?.presets ?? {}) };
+	while (true) {
+		const choice = await selectItem(ctx, title, [
+			{ value: "__add__", label: "+ Add preset", description: "Create a named group of secrets" },
+			...Object.entries(presets)
+				.sort(([a], [b]) => a.localeCompare(b))
+				.map(([name, secrets]) => ({
+					value: name,
+					label: name,
+					description: `${Object.keys(secrets).length} secret(s)`,
+				})),
+			{ value: "__save__", label: "Save" },
+			{ value: "__back__", label: "Back" },
+		]);
+		if (!choice || choice === "__back__") return;
+		if (choice === "__save__") {
+			const next: GondolinConfig | undefined =
+				Object.keys(presets).length > 0 || config?.secrets
+					? { ...config, presets: Object.keys(presets).length > 0 ? presets : undefined }
+					: undefined;
+			await onSave(next);
+			return;
+		}
+		if (choice === "__add__") {
+			const name = (await ctx.ui.input("Preset name (e.g. admin, community)", ""))?.trim();
+			if (!name) continue;
+			if (presets[name]) {
+				await showNotice(ctx, "Already exists", `Preset "${name}" already exists.`, "error");
+				continue;
+			}
+			presets = { ...presets, [name]: {} };
+			continue;
+		}
+		const action = await selectItem(ctx, choice, [
+			{ value: "edit", label: "Edit secrets" },
+			{ value: "rename", label: "Rename" },
+			{ value: "delete", label: "Delete" },
+			{ value: "back", label: "Back" },
+		]);
+		if (!action || action === "back") continue;
+		if (action === "delete") {
+			const ok = await ctx.ui.confirm("Delete preset", `Delete preset "${choice}"?`);
+			if (!ok) continue;
+			const { [choice]: _del, ...rest } = presets;
+			presets = rest;
+			continue;
+		}
+		if (action === "rename") {
+			const newName = (await ctx.ui.input("New preset name", choice))?.trim();
+			if (!newName || newName === choice) continue;
+			if (presets[newName]) {
+				await showNotice(ctx, "Already exists", `Preset "${newName}" already exists.`, "error");
+				continue;
+			}
+			const { [choice]: existing, ...rest } = presets;
+			presets = { ...rest, [newName]: existing };
+			continue;
+		}
+		if (action === "edit") {
+			const updated = await configurePreset(ctx, choice, presets[choice] ?? {});
+			if (updated !== undefined) presets = { ...presets, [choice]: updated };
+		}
+	}
+}
+
 async function promptAccessPolicy(
 	ctx: ExtensionContext,
 	current: AccessPolicy,
 	snapshot: DiscoverySnapshot | undefined,
 	dm: boolean,
-): Promise<AccessPolicy | undefined> {
+	sandbox?: boolean,
+	availablePresets: Record<string, Record<string, GondolinSecretConfig>> = {},
+	activePresetsIn: string[] = [],
+	modeIn?: ChannelMode,
+): Promise<{ policy: AccessPolicy; sandbox?: boolean; activePresets: string[]; mode?: ChannelMode } | undefined> {
 	let policy: AccessPolicy = { ...current };
+	let sandboxEnabled = sandbox !== false;
+	let activePresets = [...activePresetsIn];
+	let currentMode = modeIn;
 	while (true) {
 		const choice = await selectItem(ctx, "Access policy", [
 			{ value: "trigger", label: `Trigger: ${policy.trigger ?? (dm ? "message" : "mention")}` },
 			{ value: "bots", label: `Ignore bots: ${(policy.ignoreBots ?? true) ? "yes" : "no"}` },
 			{ value: "users", label: `Allowed users: ${policy.allowedUserIds?.length ?? 0}` },
 			{ value: "roles", label: `Allowed roles: ${policy.allowedRoleIds?.length ?? 0}` },
+			{
+				value: "secrets",
+				label: `Secrets: ${activePresets.length > 0 ? activePresets.join(", ") : "none"}`,
+				description: `${Object.keys(availablePresets).length} preset(s) available`,
+			},
+			{
+				value: "sandbox",
+				label: `Sandbox: ${sandboxEnabled ? "enabled" : "disabled"}`,
+				description: sandboxEnabled ? "Tools run inside the Gondolin VM" : "Tools run directly on the host system",
+			},
+			{
+				value: "mode",
+				label: `Mode: ${currentMode ?? "admin"}`,
+				description: modeLabel(currentMode),
+			},
 			{ value: "save", label: "Save" },
 			{ value: "cancel", label: "Cancel" },
 		]);
 		if (!choice || choice === "cancel") return undefined;
-		if (choice === "save") return policy;
+		if (choice === "save")
+			return { policy, sandbox: sandboxEnabled ? undefined : false, activePresets, mode: currentMode };
+		if (choice === "mode") {
+			const selected = await selectItem(ctx, "Channel mode", [
+				{ value: "admin", label: "Admin", description: "Full pi-chat: job queue, VM sandbox, all tools" },
+				{
+					value: "community",
+					label: "Community",
+					description: "Baldy public assistant — limited tools, football/tactics",
+				},
+				{ value: "mirror", label: "Mirror", description: "Lightweight: send images, receive final output, respond" },
+			]);
+			if (selected) currentMode = selected === "admin" ? undefined : (selected as ChannelMode);
+			continue;
+		}
+		if (choice === "secrets") {
+			const presetNames = Object.keys(availablePresets);
+			if (presetNames.length === 0) {
+				await showNotice(
+					ctx,
+					"No presets",
+					"No secret presets configured. Add presets via Secret presets in the main menu.",
+					"warning",
+				);
+				continue;
+			}
+			const items = presetNames.map((name) => ({
+				id: name,
+				label: name,
+				description: `${Object.keys(availablePresets[name] ?? {}).length} secret(s)`,
+			}));
+			const selected = await toggleItems(ctx, "Active secret presets", items, activePresets);
+			if (selected != null) activePresets = selected;
+			continue;
+		}
+		if (choice === "sandbox") {
+			sandboxEnabled = await ctx.ui.confirm(
+				"Sandbox",
+				`Sandbox is currently ${sandboxEnabled ? "enabled" : "disabled"}. Enable sandbox (Gondolin VM)?`,
+			);
+			continue;
+		}
 		if (choice === "trigger") {
 			const selected = await selectItem(ctx, "Trigger mode", [
 				{ value: "mention", label: "Mention", description: "Only @mentions create jobs" },
@@ -234,18 +446,34 @@ async function configureDiscoveredChannel(
 	const existingKey = Object.entries(account.channels).find(([, item]) => item.id === channel.id)?.[0];
 	const channelKey = existingKey ?? makeChannelKey(channel.name, channel.id);
 	const current = account.channels[channelKey];
+	const availablePresets = { ...(config.gondolin?.presets ?? {}), ...(account.gondolin?.presets ?? {}) };
 	const access = await promptAccessPolicy(
 		ctx,
 		current?.access ?? defaultAccess(channel.dm ?? false),
 		snapshot,
 		channel.dm ?? false,
+		current?.sandbox,
+		availablePresets,
+		current?.gondolin?.activePresets ?? [],
+		current?.mode,
 	);
 	if (!access) return;
+	const gondolinUpdate: GondolinConfig | undefined =
+		access.activePresets.length > 0
+			? { ...(current?.gondolin ?? {}), activePresets: access.activePresets }
+			: current?.gondolin
+				? (({ activePresets: _ap, ...rest }) => (Object.keys(rest).length > 0 ? (rest as GondolinConfig) : undefined))(
+						current.gondolin,
+					)
+				: undefined;
 	account.channels[channelKey] = {
 		id: channel.id,
 		name: channel.name,
 		dm: channel.dm,
-		access,
+		...(access.mode ? { mode: access.mode } : {}),
+		access: access.policy,
+		...(access.sandbox === false ? { sandbox: false } : {}),
+		...(gondolinUpdate ? { gondolin: gondolinUpdate } : {}),
 	};
 	await saveChatConfig(config);
 	await showNotice(ctx, "Channel configured", `Configured ${accountId}/${channelKey}`, "info");
@@ -270,17 +498,51 @@ async function configureConfiguredChannel(
 		]);
 		if (!choice || choice === "back") return;
 		if (choice === "access") {
-			const access = await promptAccessPolicy(
+			const availablePresets = { ...(config.gondolin?.presets ?? {}), ...(account.gondolin?.presets ?? {}) };
+			const result = await promptAccessPolicy(
 				ctx,
 				channel.access ?? defaultAccess(channel.dm ?? false),
 				snapshot,
 				channel.dm ?? false,
+				channel.sandbox,
+				availablePresets,
+				channel.gondolin?.activePresets ?? [],
+				channel.mode,
 			);
-			if (!access) continue;
-			channel.access = access;
+			if (!result) continue;
+			channel.access = result.policy;
+			if (result.sandbox === false) channel.sandbox = false;
+			else delete channel.sandbox;
+			channel.mode = result.mode;
+			if (result.activePresets.length > 0) {
+				channel.gondolin = { ...(channel.gondolin ?? {}), activePresets: result.activePresets };
+			} else if (channel.gondolin) {
+				const { activePresets: _ap, ...rest } = channel.gondolin;
+				channel.gondolin = Object.keys(rest).length > 0 ? (rest as GondolinConfig) : undefined;
+			}
 			account.channels[channelKey] = channel;
 			await saveChatConfig(config);
 			await showNotice(ctx, "Channel updated", `Updated ${accountId}/${channelKey}`, "info");
+			continue;
+		}
+		if (choice === "sandbox") {
+			const enable = await ctx.ui.confirm(
+				"Sandbox",
+				`Sandbox is currently ${channel.sandbox === false ? "disabled" : "enabled"}. Enable sandbox (Gondolin VM)?`,
+			);
+			const newValue = enable ? undefined : false;
+			if (newValue !== channel.sandbox) {
+				if (newValue === undefined) delete channel.sandbox;
+				else channel.sandbox = newValue;
+				account.channels[channelKey] = channel;
+				await saveChatConfig(config);
+				await showNotice(
+					ctx,
+					"Channel updated",
+					`Sandbox ${enable ? "enabled" : "disabled"} for ${accountId}/${channelKey}`,
+					"info",
+				);
+			}
 			continue;
 		}
 		if (choice === "secrets") {
@@ -311,22 +573,25 @@ async function configureDiscordAccount(ctx: ExtensionContext, accountId: string)
 		const snapshot = await loadDiscoverySnapshot(accountId);
 		const configuredIds = new Set(Object.values(account.channels).map((channel) => channel.id));
 		const channelChoices = (snapshot?.channels ?? [])
-			.map((channel) => ({
-				value: channel.id,
-				label: `${configuredIds.has(channel.id) ? "●" : "○"} ${channel.name}`,
-				description: configuredIds.has(channel.id) ? "configured" : undefined,
-			}))
+			.map((channel) => {
+				const configured = configuredIds.has(channel.id);
+				return {
+					value: channel.id,
+					label: `${configured ? "✓" : "+"} # ${channel.name}`,
+					description: configured ? "configured — enter to edit access" : "not configured — enter to add",
+				};
+			})
 			.sort((a, b) => {
-				const aConfigured = a.label.startsWith("●") ? 0 : 1;
-				const bConfigured = b.label.startsWith("●") ? 0 : 1;
+				const aConfigured = a.label.startsWith("✓") ? 0 : 1;
+				const bConfigured = b.label.startsWith("✓") ? 0 : 1;
 				return aConfigured - bConfigured || a.label.localeCompare(b.label);
 			});
 		const choice = await selectItem(ctx, `${accountId} (${account.serverName})`, [
-			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
-			{ value: "delete", label: "Delete account", description: "Remove account and all configured channels" },
+			{ value: "secrets", label: "🔐 Secrets", description: secretSummary(account.gondolin) },
+			{ value: "delete", label: "🗑 Delete account", description: "Remove account and all configured channels" },
 			{
 				value: "refresh",
-				label: "Refresh channels",
+				label: "↻ Refresh channels",
 				description: snapshot?.fetchedAt ? `Last fetched ${snapshot.fetchedAt}` : "No snapshot yet",
 			},
 			...channelChoices,
@@ -371,15 +636,15 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 		if (!account || account.service !== "telegram") return;
 		const channelChoices = Object.entries(account.channels).map(([key, channel]) => ({
 			value: key,
-			label: key,
-			description: `${channel.name ?? channel.id}${channel.dm ? " • dm" : " • group"}`,
+			label: `${channel.dm ? "✉" : "#"} ${key}`,
+			description: `${channel.name ?? channel.id} • ${channelSummary(channel)}`,
 		}));
 		const choice = await selectItem(ctx, `${accountId} (@${account.botUsername ?? "bot"})`, [
-			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
-			{ value: "add-dm", label: "Add DM", description: "Pair a DM by sending /start to the bot" },
-			{ value: "add-group", label: "Add group", description: "Observe activity after adding the bot to a group" },
-			{ value: "refresh", label: "Refresh bot info" },
-			{ value: "delete", label: "Delete account", description: "Remove account and all configured channels" },
+			{ value: "secrets", label: "🔐 Secrets", description: secretSummary(account.gondolin) },
+			{ value: "add-dm", label: "+ Add DM", description: "Pair a DM by sending /start to the bot" },
+			{ value: "add-group", label: "+ Add group", description: "Observe activity after adding the bot to a group" },
+			{ value: "refresh", label: "↻ Refresh bot info" },
+			{ value: "delete", label: "🗑 Delete account", description: "Remove account and all configured channels" },
 			...channelChoices,
 			{ value: "back", label: "Back" },
 		]);
@@ -440,10 +705,11 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 				.map(async (accountId) => ({ accountId, snapshot: await loadDiscoverySnapshot(accountId) })),
 		);
 		const choice = await selectItem(ctx, "pi-chat accounts", [
-			{ value: "__secrets__", label: "Secrets", description: secretSummary(config.gondolin) },
+			{ value: "__secrets__", label: "🔐 Global secrets", description: secretSummary(config.gondolin) },
+			{ value: "__presets__", label: "🧰 Secret presets", description: presetSummary(config.gondolin) },
 			...snapshots.map(({ accountId, snapshot }) => ({
 				value: accountId,
-				label: accountId,
+				label: `${serviceIcon(config.accounts[accountId].service)} ${accountId}`,
 				description: accountDescription(config.accounts[accountId], snapshot),
 			})),
 			{ value: "__create__", label: "+ Create account", description: "Create a Telegram or Discord account" },
@@ -451,6 +717,13 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 		if (!choice) return;
 		if (choice === "__secrets__") {
 			await configureSecrets(ctx, "pi-chat secrets", config.gondolin, async (next) => {
+				config.gondolin = next;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
+		if (choice === "__presets__") {
+			await configurePresets(ctx, "Secret presets", config.gondolin, async (next) => {
 				config.gondolin = next;
 				await saveChatConfig(config);
 			});

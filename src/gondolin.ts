@@ -2,12 +2,14 @@ import { access, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { createHttpHooks, RealFSProvider, type SecretDefinition, VM } from "@earendil-works/gondolin";
-
+import { loadChatConfig, resolveConversation } from "./config.js";
 import type { ResolvedConversation } from "./core/config-types.js";
 import { ensureConversationDirs } from "./log.js";
 
 export const GONDOLIN_WORKSPACE = "/workspace";
 export const GONDOLIN_SHARED = "/shared";
+export const GONDOLIN_COMMUNITY = "/community";
+export const COMMUNITY_CONVERSATION_ID = "discord-tactics-journal/banter";
 
 function toPosix(value: string): string {
 	return value.split(path.sep).join(path.posix.sep);
@@ -54,9 +56,17 @@ export class ConversationSandbox {
 	readonly conversation: ResolvedConversation;
 	private vm: VM | undefined;
 	private starting: Promise<VM> | undefined;
+	private communityConversation: ResolvedConversation | undefined;
 
 	constructor(conversation: ResolvedConversation) {
 		this.conversation = conversation;
+	}
+
+	private async getCommunityConversation(): Promise<ResolvedConversation | undefined> {
+		if (this.communityConversation !== undefined) return this.communityConversation;
+		const config = await loadChatConfig();
+		this.communityConversation = resolveConversation(config, COMMUNITY_CONVERSATION_ID);
+		return this.communityConversation;
 	}
 
 	async start(): Promise<VM> {
@@ -64,17 +74,19 @@ export class ConversationSandbox {
 		if (this.starting) return this.starting;
 		this.starting = (async () => {
 			await ensureConversationDirs(this.conversation);
+			const communityConversation = await this.getCommunityConversation();
+			if (communityConversation) await ensureConversationDirs(communityConversation);
 			const secretConfig = resolveSecretEnvironment(this.conversation);
+			const mounts: Record<string, RealFSProvider> = {
+				[GONDOLIN_WORKSPACE]: new RealFSProvider(this.conversation.workspaceDir),
+				[GONDOLIN_SHARED]: new RealFSProvider(this.conversation.sharedDir),
+			};
+			if (communityConversation) mounts[GONDOLIN_COMMUNITY] = new RealFSProvider(communityConversation.workspaceDir);
 			const vm = await VM.create({
 				sessionLabel: `pi-chat ${this.conversation.conversationName}`,
 				env: secretConfig.env,
 				httpHooks: secretConfig.httpHooks,
-				vfs: {
-					mounts: {
-						[GONDOLIN_WORKSPACE]: new RealFSProvider(this.conversation.workspaceDir),
-						[GONDOLIN_SHARED]: new RealFSProvider(this.conversation.sharedDir),
-					},
-				},
+				vfs: { mounts },
 			});
 			await vm.exec("command -v bash > /dev/null 2>&1 || apk add --no-cache bash > /dev/null 2>&1 || true");
 			this.vm = vm;
@@ -103,8 +115,10 @@ export class ConversationSandbox {
 		const resolved = path.posix.resolve(base, trimmed);
 		if (resolved === GONDOLIN_WORKSPACE || resolved.startsWith(`${GONDOLIN_WORKSPACE}/`)) return resolved;
 		if (allowShared && (resolved === GONDOLIN_SHARED || resolved.startsWith(`${GONDOLIN_SHARED}/`))) return resolved;
+		if (allowShared && (resolved === GONDOLIN_COMMUNITY || resolved.startsWith(`${GONDOLIN_COMMUNITY}/`)))
+			return resolved;
 		throw new Error(
-			`Path must be inside ${GONDOLIN_WORKSPACE}${allowShared ? ` or ${GONDOLIN_SHARED}` : ""}: ${inputPath}`,
+			`Path must be inside ${GONDOLIN_WORKSPACE}${allowShared ? `, ${GONDOLIN_SHARED}, or ${GONDOLIN_COMMUNITY}` : ""}: ${inputPath}`,
 		);
 	}
 
@@ -123,8 +137,14 @@ export class ConversationSandbox {
 			const relativePath = path.posix.relative(GONDOLIN_WORKSPACE, guestPath);
 			return path.join(this.conversation.workspaceDir, ...relativePath.split("/").filter(Boolean));
 		}
-		const relativePath = path.posix.relative(GONDOLIN_SHARED, guestPath);
-		return path.join(this.conversation.sharedDir, ...relativePath.split("/").filter(Boolean));
+		if (guestPath === GONDOLIN_SHARED || guestPath.startsWith(`${GONDOLIN_SHARED}/`)) {
+			const relativePath = path.posix.relative(GONDOLIN_SHARED, guestPath);
+			return path.join(this.conversation.sharedDir, ...relativePath.split("/").filter(Boolean));
+		}
+		const communityConversation = this.communityConversation;
+		if (!communityConversation) throw new Error(`Community storage is not mounted: ${inputPath}`);
+		const relativePath = path.posix.relative(GONDOLIN_COMMUNITY, guestPath);
+		return path.join(communityConversation.workspaceDir, ...relativePath.split("/").filter(Boolean));
 	}
 
 	hostToGuestPath(hostPath: string): string {
@@ -136,6 +156,10 @@ export class ConversationSandbox {
 		if (isInside(this.conversation.sharedDir, resolved)) {
 			const relativePath = toPosix(path.relative(this.conversation.sharedDir, resolved));
 			return relativePath ? path.posix.join(GONDOLIN_SHARED, relativePath) : GONDOLIN_SHARED;
+		}
+		if (this.communityConversation && isInside(this.communityConversation.workspaceDir, resolved)) {
+			const relativePath = toPosix(path.relative(this.communityConversation.workspaceDir, resolved));
+			return relativePath ? path.posix.join(GONDOLIN_COMMUNITY, relativePath) : GONDOLIN_COMMUNITY;
 		}
 		throw new Error(`Path is outside mounted storage: ${hostPath}`);
 	}

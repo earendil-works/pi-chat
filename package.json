@@ -27,7 +27,8 @@
 	},
 	"scripts": {
 		"check": "biome check . && tsc --noEmit",
-		"format": "biome check --write ."
+		"format": "biome check --write .",
+		"test:optimistic-persists": "node tests/optimistic-persists.test.mjs"
 	},
 	"peerDependencies": {
 		"@mariozechner/pi-coding-agent": "*",

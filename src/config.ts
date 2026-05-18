@@ -15,6 +15,7 @@ import type {
 export const CHAT_HOME = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "chat");
 export const CHAT_CONFIG_PATH = join(CHAT_HOME, "config.json");
 export const CHAT_CACHE_DIR = join(CHAT_HOME, "cache");
+export const COMMUNITY_MODEL_FILE = join(CHAT_HOME, "community-model.json");
 
 function sanitizePathSegment(value: string): string {
 	return value.replace(/[^a-zA-Z0-9._-]+/g, "_");
@@ -40,13 +41,22 @@ function mergeAccess(...policies: Array<AccessPolicy | undefined>): AccessPolicy
 	return merged;
 }
 
-function mergeGondolinSecrets(...configs: Array<GondolinConfig | undefined>): Record<string, GondolinSecretConfig> {
+function resolveGondolinSecrets(
+	globalConfig: GondolinConfig | undefined,
+	accountConfig: GondolinConfig | undefined,
+	channelConfig: GondolinConfig | undefined,
+): Record<string, GondolinSecretConfig> {
 	const merged: Record<string, GondolinSecretConfig> = {};
-	for (const config of configs) {
-		for (const [name, secret] of Object.entries(config?.secrets ?? {})) {
+	const add = (secrets: Record<string, GondolinSecretConfig> | undefined) => {
+		for (const [name, secret] of Object.entries(secrets ?? {})) {
 			merged[name] = { value: secret.value, hosts: [...secret.hosts] };
 		}
-	}
+	};
+	add(globalConfig?.secrets);
+	add(accountConfig?.secrets);
+	const allPresets = { ...(globalConfig?.presets ?? {}), ...(accountConfig?.presets ?? {}) };
+	for (const presetName of channelConfig?.activePresets ?? []) add(allPresets[presetName]);
+	add(channelConfig?.secrets);
 	return merged;
 }
 
@@ -71,7 +81,7 @@ function buildResolvedConversation(
 		conversationId: `${accountId}/${channelKey}`,
 		conversationName: `${account.name ?? accountId} / ${channel.name ?? channelKey}`,
 		access: mergeAccess(account.access, channel.access),
-		gondolinSecrets: mergeGondolinSecrets(config.gondolin, account.gondolin, channel.gondolin),
+		gondolinSecrets: resolveGondolinSecrets(config.gondolin, account.gondolin, channel.gondolin),
 		accountDir,
 		sharedDir: join(accountDir, "shared"),
 		conversationDir,

@@ -84,6 +84,12 @@ Users in the connected chat can send these commands (with or without mentioning 
 | `status` | Show model, usage, context stats |
 | `compact` | Trigger context compaction |
 | `new` | Start a new pi session |
+| `restart` / `reload` | Shut down the current worker so its supervisor can relaunch it |
+| `model <query> [level]` | Switch model (fuzzy match) and optionally set thinking level (off/minimal/low/medium/high/xhigh) |
+| `cycle-models show` | Show pi-cycle tier mappings from `~/.pi/agent/pi-cycle.json` |
+| `cycle-models <1|2|3>` | Switch to the next model in a pi-cycle tier |
+| `cycle-models thinking <1|2|3> <provider/model> <level>` | Set a per-tier thinking level (`inherit/off/minimal/low/medium/high/xhigh`) |
+| `<shortcut> message` | Use the pi-cycle shortcut (`z`, `zz`, `zzz` by default) to switch tiers and send `message` |
 
 ---
 
