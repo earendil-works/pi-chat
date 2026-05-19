@@ -1,3 +1,4 @@
+import type { Model } from "@mariozechner/pi-ai";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { BorderedLoader, DynamicBorder, getSettingsListTheme } from "@mariozechner/pi-coding-agent";
 import {
@@ -33,6 +34,44 @@ export async function selectItem(
 		container.addChild(list);
 		container.addChild(new Text(theme.fg("dim", helpText), 1, 0));
 		container.addChild(new DynamicBorder((value: string) => theme.fg("accent", value)));
+		return {
+			render: (width: number) => container.render(width),
+			invalidate: () => container.invalidate(),
+			handleInput: (data: string) => {
+				list.handleInput?.(data);
+				tui.requestRender();
+			},
+		};
+	});
+}
+
+export async function selectModel(ctx: ExtensionContext, initialSearchInput = ""): Promise<Model<any> | null> {
+	const available = await ctx.modelRegistry.getAvailable();
+	const items: SelectItem[] = available.map((model) => ({
+		value: `${model.provider}/${model.id}`,
+		label: model.name || model.id,
+		description: model.provider,
+	}));
+	return ctx.ui.custom<Model<any> | null>((tui, theme, _kb, done) => {
+		const container = new Container();
+		container.addChild(new DynamicBorder((value: string) => theme.fg("accent", value)));
+		container.addChild(new Text(theme.fg("accent", theme.bold("Select model")), 1, 0));
+		const list = new SelectList(items, 12, {
+			selectedPrefix: (text) => theme.fg("accent", text),
+			selectedText: (text) => theme.fg("accent", text),
+			description: (text) => theme.fg("muted", text),
+			scrollInfo: (text) => theme.fg("dim", text),
+			noMatch: (text) => theme.fg("warning", text),
+		});
+		list.onSelect = (item) => {
+			const [provider, ...idParts] = item.value.split("/");
+			done(available.find((model) => model.provider === provider && model.id === idParts.join("/")) ?? null);
+		};
+		list.onCancel = () => done(null);
+		container.addChild(list);
+		container.addChild(new Text(theme.fg("dim", "type to filter • ↑↓ navigate • enter select • esc cancel"), 1, 0));
+		container.addChild(new DynamicBorder((value: string) => theme.fg("accent", value)));
+		if (initialSearchInput) list.handleInput?.(initialSearchInput);
 		return {
 			render: (width: number) => container.render(width),
 			invalidate: () => container.invalidate(),

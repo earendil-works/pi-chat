@@ -40,7 +40,7 @@ import type { LiveConnection } from "./src/live/types.js";
 import { ConversationRuntime } from "./src/runtime.js";
 import { createSecretRequest, persistPendingSecretRequest, tryDecryptSecret } from "./src/secrets.js";
 import { runChatConfigUI } from "./src/tui/chat-config.js";
-import { runWithLoader, selectItem, showNotice } from "./src/tui/dialogs.js";
+import { runWithLoader, selectItem, selectModel, showNotice } from "./src/tui/dialogs.js";
 
 const COMMUNITY_CHANNEL_IDS = new Set([
 	"1098742662040920074", // banter
@@ -895,22 +895,30 @@ export default function (pi: ExtensionAPI) {
 								const modelPart = thinkingLevel ? tokens.slice(0, -1).join(" ") : tokens.join(" ");
 								const q = modelPart.toLowerCase();
 								const available = await ctx.modelRegistry.getAvailable();
-								const match = q
+								let match = q
 									? available.find(
 											(m) =>
 												m.id.toLowerCase().includes(q) ||
 												(m.name ?? "").toLowerCase().includes(q) ||
 												`${m.provider}/${m.id}`.toLowerCase().includes(q),
 										)
-									: ctx.model;
-								if (!match) {
+									: undefined;
+								if (!match && !q && ctx.hasUI && !chatTurnInFlight && ctx.isIdle()) {
+									match = (await selectModel(ctx)) ?? undefined;
+									if (!match && !thinkingLevel) return;
+								}
+								if (!match && q) {
 									const names = available.map((m) => `${m.provider}/${m.id}`).join(", ");
 									await liveConnection?.sendImmediate(`No model matching "${modelPart}". Available: ${names}`);
 									return;
 								}
+								if (!match && !thinkingLevel) {
+									await liveConnection?.sendImmediate("Use /model <provider/model> to switch models.");
+									return;
+								}
 								const switchModel = async () => {
 									const parts: string[] = [];
-									if (q) {
+									if (match) {
 										const ok = await pi.setModel(match);
 										if (ok) {
 											parts.push(`Model: ${match.provider}/${match.id}`);
@@ -934,7 +942,7 @@ export default function (pi: ExtensionAPI) {
 								if (chatTurnInFlight || !ctx.isIdle()) {
 									pendingControlAction = switchModel;
 									ctx.abort();
-									const desc = [q && `${match.provider}/${match.id}`, thinkingLevel]
+									const desc = [match && `${match.provider}/${match.id}`, thinkingLevel]
 										.filter(Boolean)
 										.join(", thinking: ");
 									await liveConnection?.sendImmediate(`Aborting current turn, then switching to ${desc}.`);

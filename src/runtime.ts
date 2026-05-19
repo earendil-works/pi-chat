@@ -175,9 +175,9 @@ export class ConversationRuntime {
 		);
 		for (const alias of aliases) text = text.replace(new RegExp(`@${escapeRegExp(alias || "")}\\b`, "ig"), " ");
 		const trimmed = text.replace(/\s+/g, " ").trim();
-		const match = trimmed.match(/^\/?(model)\s+(.+)$/i);
+		const match = trimmed.match(/^\/?model(?:\s+(.+))?$/i);
 		if (!match) return undefined;
-		return match[2].trim();
+		return (match[1] ?? "").trim();
 	}
 
 	matchesStopCommand(input: InboundMessageInput): boolean {
