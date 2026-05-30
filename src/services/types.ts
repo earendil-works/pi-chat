@@ -4,6 +4,7 @@ import type { AccountValidationResult, DiscoverySnapshot } from "../core/discove
 export interface AccountDraft {
 	service: ChatService;
 	botToken: string;
+	appToken?: string;
 	name?: string;
 }
 
