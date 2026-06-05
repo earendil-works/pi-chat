@@ -46,6 +46,10 @@ interface TelegramAudio {
 	file_name?: string;
 	mime_type?: string;
 }
+interface TelegramVoice {
+	file_id: string;
+	mime_type?: string;
+}
 interface TelegramMessage {
 	message_id: number;
 	media_group_id?: string;
@@ -57,6 +61,7 @@ interface TelegramMessage {
 	document?: TelegramDocument;
 	video?: TelegramVideo;
 	audio?: TelegramAudio;
+	voice?: TelegramVoice;
 }
 interface TelegramUpdate {
 	update_id: number;
@@ -158,6 +163,18 @@ async function messageToInput(
 				message.audio.file_id,
 				message.audio.file_name || `audio-${remoteMessageId}.mp3`,
 				message.audio.mime_type,
+			)),
+		);
+	if (message.voice)
+		attachments.push(
+			...(await downloadTelegramFile(
+				conversation,
+				account.botToken,
+				remoteMessageId,
+				5,
+				message.voice.file_id,
+				`voice-${remoteMessageId}.ogg`,
+				message.voice.mime_type || "audio/ogg",
 			)),
 		);
 	return {
