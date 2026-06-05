@@ -1,8 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { type Dirent, constants as fsConstants } from "node:fs";
-import { lstat, mkdir, open, readdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { basename, extname, isAbsolute, join, relative } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { extname, join, posix as posixPath } from "node:path";
 import { ensureGuestAssets, hasGuestAssets } from "@earendil-works/gondolin";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
@@ -28,6 +27,7 @@ import {
 } from "./src/config.js";
 
 import type { ResolvedConversation } from "./src/core/config-types.js";
+import type { OutboundAttachment } from "./src/core/runtime-types.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
 import { connectLive } from "./src/live/index.js";
 import type { LiveConnection } from "./src/live/types.js";
@@ -124,11 +124,6 @@ interface ChatPromptSkill {
 	filePath: string;
 }
 
-function isInsideHostPath(root: string, value: string): boolean {
-	const rel = relative(root, value);
-	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
 function escapeXml(value: string): string {
 	return value
 		.replace(/&/g, "&amp;")
@@ -136,24 +131,6 @@ function escapeXml(value: string): string {
 		.replace(/>/g, "&gt;")
 		.replace(/"/g, "&quot;")
 		.replace(/'/g, "&apos;");
-}
-
-async function safeReadMountedText(root: string, filePath: string): Promise<string> {
-	try {
-		const realRoot = await realpath(root);
-		const resolvedPath = await realpath(filePath);
-		if (!isInsideHostPath(realRoot, resolvedPath)) return "";
-		const handle = await open(resolvedPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-		try {
-			const info = await handle.stat();
-			if (!info.isFile()) return "";
-			return await handle.readFile("utf8");
-		} finally {
-			await handle.close();
-		}
-	} catch {
-		return "";
-	}
 }
 
 function parseSkillFrontmatter(content: string): { name?: string; description?: string; disabled?: boolean } {
@@ -175,40 +152,38 @@ function parseSkillFrontmatter(content: string): { name?: string; description?: 
 	return frontmatter;
 }
 
-async function loadSafeChatSkills(root: string): Promise<ChatPromptSkill[]> {
-	const skillsRoot = join(root, "skills");
+async function loadSafeChatSkills(sandbox: ConversationSandbox, root: string): Promise<ChatPromptSkill[]> {
+	const skillsRoot = posixPath.join(root, "skills");
 	const skills: ChatPromptSkill[] = [];
 	async function addSkill(filePath: string, defaultName: string): Promise<void> {
-		const content = await safeReadMountedText(root, filePath);
+		const content = await sandbox.readMountedText(filePath);
 		const frontmatter = parseSkillFrontmatter(content);
 		if (!frontmatter.description?.trim() || frontmatter.disabled) return;
 		skills.push({ name: frontmatter.name || defaultName, description: frontmatter.description, filePath });
 	}
 	async function walkSkills(dir: string, depth: number): Promise<void> {
 		if (depth > 8) return;
-		let entries: Dirent<string>[];
+		let names: string[];
 		try {
-			entries = await readdir(dir, { withFileTypes: true });
+			names = await sandbox.listMountedDirectory(dir);
 		} catch {
 			return;
 		}
-		for (const entry of entries) {
-			if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.isSymbolicLink()) continue;
-			const fullPath = join(dir, entry.name);
-			if (entry.isFile() && extname(entry.name).toLowerCase() === ".md") {
-				await addSkill(fullPath, basename(entry.name, ".md"));
+		for (const name of names) {
+			if (name.startsWith(".") || name === "node_modules") continue;
+			const fullPath = posixPath.join(dir, name);
+			const entryStat = await sandbox.stat(fullPath).catch(() => undefined);
+			if (!entryStat) continue;
+			if (entryStat.isFile()) {
+				if (extname(name).toLowerCase() === ".md") await addSkill(fullPath, posixPath.basename(name, ".md"));
 				continue;
 			}
-			if (!entry.isDirectory()) continue;
-			const skillMd = join(fullPath, "SKILL.md");
-			try {
-				const info = await lstat(skillMd);
-				if (info.isFile()) {
-					await addSkill(skillMd, entry.name);
-					continue;
-				}
-			} catch {
-				// Not a skill root; recurse below.
+			if (!entryStat.isDirectory()) continue;
+			const skillMd = posixPath.join(fullPath, "SKILL.md");
+			const skillStat = await sandbox.stat(skillMd).catch(() => undefined);
+			if (skillStat?.isFile()) {
+				await addSkill(skillMd, name);
+				continue;
 			}
 			await walkSkills(fullPath, depth + 1);
 		}
@@ -442,7 +417,7 @@ export default function (pi: ExtensionAPI) {
 	let configLoadedAtLeastOnce = false;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let workerStatusInterval: ReturnType<typeof setInterval> | undefined;
-	let queuedOutboundAttachments: string[] = [];
+	let queuedOutboundAttachments: OutboundAttachment[] = [];
 	let pendingChatDispatch = false;
 	let pendingControlAction: (() => Promise<void>) | undefined;
 	let activeTriggerMessageId: string | undefined;
@@ -526,54 +501,30 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function buildMemoryPromptSuffix(): Promise<string> {
-		if (!runtime) return "";
+		if (!runtime || !sandbox) return "";
 		const sections: string[] = [];
-		const accountMemory = await safeReadMountedText(
-			runtime.conversation.sharedDir,
-			runtime.conversation.accountMemoryPath,
-		);
-		const channelMemory = await safeReadMountedText(
-			runtime.conversation.workspaceDir,
-			runtime.conversation.channelMemoryPath,
-		);
+		const accountMemory = await sandbox.readMountedText(`${GONDOLIN_SHARED}/memory.md`);
+		const channelMemory = await sandbox.readMountedText(`${GONDOLIN_WORKSPACE}/memory.md`);
 		if (accountMemory.trim()) sections.push(`Account memory (/shared/memory.md):\n${accountMemory.trim()}`);
 		if (channelMemory.trim()) sections.push(`Channel memory (/workspace/memory.md):\n${channelMemory.trim()}`);
 		if (sections.length === 0) return "";
 		return `\n\nPersistent memory:\n${sections.join("\n\n")}`;
 	}
 
-	function hostToGuestPath(hostPath: string): string {
-		if (!runtime) return hostPath;
-		const { workspaceDir, sharedDir } = runtime.conversation;
-		if (hostPath === workspaceDir || hostPath.startsWith(`${workspaceDir}/`)) {
-			const suffix = hostPath.slice(workspaceDir.length).replace(/^\//, "");
-			return suffix ? `/workspace/${suffix}` : "/workspace";
-		}
-		if (hostPath === sharedDir || hostPath.startsWith(`${sharedDir}/`)) {
-			const suffix = hostPath.slice(sharedDir.length).replace(/^\//, "");
-			return suffix ? `/shared/${suffix}` : "/shared";
-		}
-		return hostPath;
-	}
-
 	async function buildSkillsPromptSuffix(): Promise<string> {
-		if (!runtime) return "";
-		const sharedSkills = await loadSafeChatSkills(runtime.conversation.sharedDir);
-		const channelSkills = await loadSafeChatSkills(runtime.conversation.workspaceDir);
+		if (!runtime || !sandbox) return "";
+		const sharedSkills = await loadSafeChatSkills(sandbox, GONDOLIN_SHARED);
+		const channelSkills = await loadSafeChatSkills(sandbox, GONDOLIN_WORKSPACE);
 		const skillMap = new Map<string, ChatPromptSkill>();
 		for (const skill of sharedSkills) skillMap.set(skill.name, skill);
 		for (const skill of channelSkills) skillMap.set(skill.name, skill);
-		const allSkills = [...skillMap.values()].map((skill) => ({ ...skill, filePath: hostToGuestPath(skill.filePath) }));
-		const formatted = formatChatSkillsForPrompt(allSkills);
+		const formatted = formatChatSkillsForPrompt([...skillMap.values()]);
 		return formatted ? `\n\nAvailable skills:\n${formatted}` : "";
 	}
 
 	async function buildSystemMdSuffix(): Promise<string> {
-		if (!runtime) return "";
-		const systemMd = await safeReadMountedText(
-			runtime.conversation.workspaceDir,
-			join(runtime.conversation.workspaceDir, "SYSTEM.md"),
-		);
+		if (!runtime || !sandbox) return "";
+		const systemMd = await sandbox.readMountedText(`${GONDOLIN_WORKSPACE}/SYSTEM.md`);
 		if (!systemMd.trim()) return "";
 		return `\n\nSystem configuration log (/workspace/SYSTEM.md):\n${systemMd.trim()}`;
 	}
@@ -800,19 +751,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	async function showChatContextMessage(): Promise<void> {
-		if (!runtime) return;
+		if (!runtime || !sandbox) return;
 		const channelName = runtime.conversation.channel.name ?? runtime.conversation.channelKey;
 		const mode = runtime.conversation.channel.dm ? "dm" : "mention";
 		const service = runtime.conversation.service;
 		const systemPromptAdditions = buildChatSystemPromptSuffix(service, mode, channelName).trim();
-		const accountMemory = await safeReadMountedText(
-			runtime.conversation.sharedDir,
-			runtime.conversation.accountMemoryPath,
-		);
-		const channelMemory = await safeReadMountedText(
-			runtime.conversation.workspaceDir,
-			runtime.conversation.channelMemoryPath,
-		);
+		const accountMemory = await sandbox.readMountedText(`${GONDOLIN_SHARED}/memory.md`);
+		const channelMemory = await sandbox.readMountedText(`${GONDOLIN_WORKSPACE}/memory.md`);
 		const skillsSuffix = await buildSkillsPromptSuffix();
 		const sections = [`Connected to ${service} ${mode} ${channelName}.`, "", "System prompt:", systemPromptAdditions];
 		if (accountMemory.trim()) sections.push("", "Account memory (/shared/memory.md):", accountMemory.trim());
@@ -1024,7 +969,7 @@ export default function (pi: ExtensionAPI) {
 			signal?.throwIfAborted?.();
 			for (const path of params.paths) {
 				signal?.throwIfAborted?.();
-				queuedOutboundAttachments.push(await sandbox.stageAttachment(path));
+				queuedOutboundAttachments.push(await sandbox.readAttachment(path));
 			}
 			return {
 				content: [{ type: "text", text: `Queued ${params.paths.length} attachment(s).` }],
@@ -1434,13 +1379,13 @@ export default function (pi: ExtensionAPI) {
 		}
 		stopTypingLoop();
 		let remoteMessageId: string | undefined;
-		const attachmentPaths = [...queuedOutboundAttachments];
+		const attachments = [...queuedOutboundAttachments];
 		queuedOutboundAttachments = [];
-		const finalText = summary.text || (attachmentPaths.length > 0 ? "Attached requested file(s)." : "");
+		const finalText = summary.text || (attachments.length > 0 ? "Attached requested file(s)." : "");
 		if (liveConnection && finalText) {
 			try {
 				remoteMessageId = await Promise.race([
-					liveConnection.send(finalText, attachmentPaths, ctx.signal, activeTriggerMessageId),
+					liveConnection.send(finalText, attachments, ctx.signal, activeTriggerMessageId),
 					new Promise<string>((_, reject) => setTimeout(() => reject(new Error("send timed out")), 120000)),
 					waitForAbort(ctx.signal),
 				]);
@@ -1460,7 +1405,11 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		chatTurnInFlight = false;
-		await runtime.completeActiveJob(finalText, remoteMessageId, attachmentPaths);
+		await runtime.completeActiveJob(
+			finalText,
+			remoteMessageId,
+			attachments.map((attachment) => attachment.path),
+		);
 		updateStatus(ctx);
 		await tryDispatch(ctx);
 	});

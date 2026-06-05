@@ -1,11 +1,11 @@
-import { randomUUID } from "node:crypto";
-import { constants as fsConstants, realpathSync } from "node:fs";
-import { access, mkdir, open, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { access, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { createHttpHooks, RealFSProvider, type SecretDefinition, VM } from "@earendil-works/gondolin";
 
 import type { ResolvedConversation } from "./core/config-types.js";
+import type { OutboundAttachment } from "./core/runtime-types.js";
 import { ensureConversationDirs } from "./log.js";
 
 export const GONDOLIN_WORKSPACE = "/workspace";
@@ -23,6 +23,26 @@ function isInside(root: string, value: string): boolean {
 function guestMountRoot(guestPath: string): typeof GONDOLIN_WORKSPACE | typeof GONDOLIN_SHARED | undefined {
 	if (guestPath === GONDOLIN_WORKSPACE || guestPath.startsWith(`${GONDOLIN_WORKSPACE}/`)) return GONDOLIN_WORKSPACE;
 	if (guestPath === GONDOLIN_SHARED || guestPath.startsWith(`${GONDOLIN_SHARED}/`)) return GONDOLIN_SHARED;
+	return undefined;
+}
+
+function guessMimeType(fileName: string): string | undefined {
+	const ext = path.posix.extname(fileName).toLowerCase();
+	if (ext === ".png") return "image/png";
+	if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+	if (ext === ".gif") return "image/gif";
+	if (ext === ".webp") return "image/webp";
+	if (ext === ".mp3") return "audio/mpeg";
+	if (ext === ".wav") return "audio/wav";
+	if (ext === ".ogg") return "audio/ogg";
+	if (ext === ".m4a") return "audio/mp4";
+	if (ext === ".mp4") return "video/mp4";
+	if (ext === ".mov") return "video/quicktime";
+	if (ext === ".webm") return "video/webm";
+	if (ext === ".pdf") return "application/pdf";
+	if (ext === ".json") return "application/json";
+	if (ext === ".md") return "text/markdown";
+	if (ext === ".txt" || ext === ".log") return "text/plain";
 	return undefined;
 }
 
@@ -113,25 +133,42 @@ export class ConversationSandbox {
 		return guestPath;
 	}
 
-	async stageAttachment(inputPath: string): Promise<string> {
-		const sourcePath = this.guestToHostPath(inputPath);
-		const handle = await open(sourcePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+	async readAttachment(inputPath: string): Promise<OutboundAttachment> {
+		const vm = await this.start();
+		const guestPath = this.resolveGuestPath(inputPath);
+		const fileStats = await vm.fs.stat(guestPath);
+		if (!fileStats.isFile()) throw new Error(`Not a file: ${inputPath}`);
+		const name = path.posix.basename(guestPath).replace(/[^a-zA-Z0-9._-]+/g, "_") || "attachment";
+		return {
+			path: guestPath,
+			name,
+			data: new Uint8Array(await vm.fs.readFile(guestPath)),
+			mimeType: guessMimeType(guestPath),
+		};
+	}
+
+	async readMountedText(inputPath: string): Promise<string> {
 		try {
-			const fileStats = await handle.stat();
-			if (!fileStats.isFile()) throw new Error(`Not a file: ${inputPath}`);
-			const stagingDir = path.join(this.conversation.gondolinDir, "outgoing");
-			await mkdir(stagingDir, { recursive: true });
-			const safeName = path.basename(sourcePath).replace(/[^a-zA-Z0-9._-]+/g, "_") || "attachment";
-			const stagedPath = path.join(stagingDir, `${Date.now()}-${randomUUID()}-${safeName}`);
-			await writeFile(stagedPath, await handle.readFile(), { flag: "wx" });
-			return stagedPath;
-		} finally {
-			await handle.close();
+			const vm = await this.start();
+			const guestPath = this.resolveGuestPath(inputPath);
+			const fileStats = await vm.fs.stat(guestPath);
+			if (!fileStats.isFile()) return "";
+			return await vm.fs.readFile(guestPath, { encoding: "utf8" });
+		} catch {
+			return "";
 		}
 	}
 
-	resolveToolPath(inputPath: string): string {
-		return this.resolveGuestPath(inputPath);
+	async listMountedDirectory(inputPath: string): Promise<string[]> {
+		const vm = await this.start();
+		const guestPath = this.resolveGuestPath(inputPath);
+		return vm.fs.listDir(guestPath);
+	}
+
+	async stat(inputPath: string) {
+		const vm = await this.start();
+		const guestPath = this.resolveGuestPath(inputPath);
+		return vm.fs.stat(guestPath);
 	}
 
 	guestToHostPath(inputPath: string): string {

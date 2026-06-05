@@ -10,6 +10,13 @@ export interface AttachmentInput {
 	remoteUrl?: string;
 }
 
+export interface OutboundAttachment {
+	path: string;
+	name: string;
+	data: Uint8Array;
+	mimeType?: string;
+}
+
 export interface StoredAttachment {
 	kind: AttachmentKind;
 	name: string;
