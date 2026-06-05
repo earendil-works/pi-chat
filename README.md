@@ -1,6 +1,6 @@
 # pi-chat
 
-A pi extension that bridges Discord and Telegram channels to a sandboxed pi session. Each connected channel gets its own [Gondolin](https://github.com/earendil-works/gondolin) micro-VM with persistent workspace, shared storage, memory, and skills.
+A pi extension that bridges Discord, Telegram, and Slack channels to a sandboxed pi session. Each connected channel gets its own [Gondolin](https://github.com/earendil-works/gondolin) micro-VM with persistent workspace, shared storage, memory, and skills.
 
 ## Quick Start
 
@@ -21,14 +21,14 @@ pi -e /path/to/pi-chat
 
 - [QEMU](https://www.qemu.org/) installed (`brew install qemu` on macOS)
 - Gondolin guest image (downloaded automatically on first connect)
-- A Discord bot token or Telegram bot token
+- A Discord bot token, Telegram bot token, or Slack bot/app tokens
 - `tmux` for multi-channel worker orchestration
 
 ---
 
 ## Features
 
-- **Discord server channels** and **Telegram DMs/groups**
+- **Discord server channels**, **Telegram DMs/groups**, and **Slack channels/DMs**
 - **Gondolin VM sandbox** per connection — tools run inside an isolated Alpine Linux micro-VM
 - **Persistent workspace** and **shared storage** across sessions
 - **Streamed preview** responses with edit-in-place
@@ -59,6 +59,16 @@ pi -e /path/to/pi-chat
 2. Run `/chat-config` → Create account → Telegram
 3. Enter your bot token
 4. Add DMs or groups through the guided setup
+
+### Slack
+
+1. Create a Slack app in the [Slack API dashboard](https://api.slack.com/apps)
+2. Enable Socket Mode and create an app-level token with `connections:write`
+3. Add bot scopes: `app_mentions:read`, `channels:history`, `channels:read`, `chat:write`, `files:read`, `files:write`, `im:history`, `im:read`, `im:write`, `users:read`
+4. Install the app into the workspace
+5. Run `/chat-config` -> Create account -> Slack
+6. Enter the bot token (`xoxb-...`) and app token (`xapp-...`)
+7. Select channels or DMs from the discovered Slack targets
 
 ---
 
