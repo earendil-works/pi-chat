@@ -27,9 +27,14 @@ import {
 	resolveConversation,
 } from "./src/config.js";
 
-import type { ResolvedConversation } from "./src/core/config-types.js";
+import type { ResolvedConversation, TelegramAccountConfig } from "./src/core/config-types.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
 import { connectLive } from "./src/live/index.js";
+import {
+	connectTelegramDispatcher,
+	connectTelegramQueuedLive,
+	type TelegramDispatcherConnection,
+} from "./src/live/telegram-queue.js";
 import type { LiveConnection } from "./src/live/types.js";
 import { ConversationRuntime } from "./src/runtime.js";
 import { createSecretRequest, tryDecryptSecret } from "./src/secrets.js";
@@ -93,6 +98,8 @@ type PersistedChatState = {
 
 const SESSION_STATE_CUSTOM_TYPE = "pi-chat-state";
 const CHAT_CONVERSATION_FLAG = "chat-conversation";
+const CHAT_TELEGRAM_DISPATCHER_FLAG = "chat-telegram-dispatcher";
+const CHAT_TELEGRAM_QUEUE_FLAG = "chat-telegram-queue";
 const WORKER_TMUX_PREFIX = "pi-chat-worker-";
 const DASHBOARD_TMUX_SESSION = "pi-chat-dashboard";
 const WORKER_STATUS_DIR = join(CHAT_HOME, "worker-status");
@@ -242,6 +249,10 @@ function tmuxSafeName(value: string): string {
 	return `${WORKER_TMUX_PREFIX}${safe}`.slice(0, 100);
 }
 
+function telegramDispatcherTmuxName(accountId: string): string {
+	return tmuxSafeName(`telegram-dispatcher-${accountId}`);
+}
+
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
@@ -350,7 +361,12 @@ function createDashboardTmux(): string {
 	return DASHBOARD_TMUX_SESSION;
 }
 
-function spawnConversationTmux(ctx: ExtensionContext, conversation: ResolvedConversation, restart: boolean): string {
+function spawnConversationTmux(
+	ctx: ExtensionContext,
+	conversation: ResolvedConversation,
+	restart: boolean,
+	options: { telegramQueue?: boolean } = {},
+): string {
 	const tmuxName = tmuxSafeName(conversation.conversationId);
 	if (restart && tmuxSessionExists(tmuxName)) spawnSync("tmux", ["kill-session", "-t", tmuxName], { stdio: "ignore" });
 	if (tmuxSessionExists(tmuxName)) return `${conversation.conversationName}: already running (${tmuxName})`;
@@ -371,6 +387,7 @@ function spawnConversationTmux(ctx: ExtensionContext, conversation: ResolvedConv
 		...explicitExtensionCommandParts(),
 		`--${CHAT_CONVERSATION_FLAG}`,
 		shellQuote(conversation.conversationId),
+		...(options.telegramQueue ? [`--${CHAT_TELEGRAM_QUEUE_FLAG}`, "true"] : []),
 	].join(" ");
 	const result = spawnSync("tmux", ["new-session", "-d", "-s", tmuxName, "-c", ctx.cwd, command], {
 		encoding: "utf8",
@@ -381,6 +398,48 @@ function spawnConversationTmux(ctx: ExtensionContext, conversation: ResolvedConv
 		);
 	}
 	return `${conversation.conversationName}: started (${tmuxName})`;
+}
+
+function spawnTelegramDispatcherTmux(
+	ctx: ExtensionContext,
+	accountId: string,
+	account: TelegramAccountConfig,
+	restart: boolean,
+): string {
+	const tmuxName = telegramDispatcherTmuxName(accountId);
+	if (restart) {
+		if (tmuxSessionExists(tmuxName)) spawnSync("tmux", ["kill-session", "-t", tmuxName], { stdio: "ignore" });
+		const previousAccountWorker = tmuxSafeName(`telegram-account-${accountId}`);
+		if (tmuxSessionExists(previousAccountWorker))
+			spawnSync("tmux", ["kill-session", "-t", previousAccountWorker], { stdio: "ignore" });
+	}
+	if (tmuxSessionExists(tmuxName)) return `${account.name ?? accountId} dispatcher: already running (${tmuxName})`;
+
+	const sessionDir = join(CHAT_HOME, "tmux-sessions", tmuxName);
+	const session = SessionManager.continueRecent(ctx.cwd, sessionDir);
+	session.appendSessionInfo(`pi-chat ${account.name ?? accountId} Telegram dispatcher`);
+	const sessionFile = session.getSessionFile();
+	if (!sessionFile) throw new Error(`Could not create pi session for ${account.name ?? accountId} dispatcher`);
+
+	const command = [
+		"exec pi",
+		"--session",
+		shellQuote(sessionFile),
+		"--session-dir",
+		shellQuote(sessionDir),
+		...explicitExtensionCommandParts(),
+		`--${CHAT_TELEGRAM_DISPATCHER_FLAG}`,
+		shellQuote(accountId),
+	].join(" ");
+	const result = spawnSync("tmux", ["new-session", "-d", "-s", tmuxName, "-c", ctx.cwd, command], {
+		encoding: "utf8",
+	});
+	if (result.error || result.status !== 0) {
+		throw new Error(
+			result.stderr.trim() || result.error?.message || `tmux failed for ${account.name ?? accountId} dispatcher`,
+		);
+	}
+	return `${account.name ?? accountId} dispatcher: started (${tmuxName})`;
 }
 
 function abortError(): Error {
@@ -433,10 +492,19 @@ export default function (pi: ExtensionAPI) {
 		description: "Auto-connect pi-chat to a configured account/channel",
 		type: "string",
 	});
+	pi.registerFlag(CHAT_TELEGRAM_DISPATCHER_FLAG, {
+		description: "Run the Telegram account dispatcher for a configured account",
+		type: "string",
+	});
+	pi.registerFlag(CHAT_TELEGRAM_QUEUE_FLAG, {
+		description: "Use the local Telegram dispatcher queue instead of polling getUpdates",
+		type: "string",
+	});
 
 	let runtime: ConversationRuntime | undefined;
 	let liveConnection: LiveConnection | undefined;
 	let sandbox: ConversationSandbox | undefined;
+	let telegramDispatcher: TelegramDispatcherConnection | undefined;
 	let ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
 	let chatTurnInFlight = false;
 	let configLoadedAtLeastOnce = false;
@@ -523,6 +591,37 @@ export default function (pi: ExtensionAPI) {
 			await ensureGuestAssets();
 		});
 		if (result.error) throw new Error(result.error);
+	}
+
+	function updateDispatcherStatus(ctx: ExtensionContext, accountName: string, error?: string): void {
+		const theme = ctx.ui.theme;
+		const label = theme.fg("accent", "chat");
+		if (error) {
+			ctx.ui.setStatus("chat", `${label} ${theme.fg("error", `dispatcher ${accountName}: ${error}`)}`);
+			return;
+		}
+		ctx.ui.setStatus("chat", `${label} ${theme.fg("success", `dispatcher ${accountName}`)}`);
+	}
+
+	async function connectTelegramDispatcherProcess(ctx: ExtensionContext, accountId: string): Promise<boolean> {
+		const config = await loadChatConfig();
+		const account = config.accounts[accountId];
+		if (!account || account.service !== "telegram") {
+			updateDispatcherStatus(ctx, accountId, `Unknown Telegram account: ${accountId}`);
+			return false;
+		}
+		const accountName = account.name ?? (account.botUsername ? `@${account.botUsername}` : accountId);
+		const result = await runWithLoader(ctx, `Starting ${accountName} Telegram dispatcher...`, async () => {
+			telegramDispatcher = await connectTelegramDispatcher(accountId, ownerId, async (error) => {
+				updateDispatcherStatus(ctx, accountName, error.message);
+			});
+		});
+		if (result.error) {
+			updateDispatcherStatus(ctx, accountName, result.error);
+			return false;
+		}
+		updateDispatcherStatus(ctx, accountName);
+		return true;
 	}
 
 	async function buildMemoryPromptSuffix(): Promise<string> {
@@ -675,7 +774,9 @@ export default function (pi: ExtensionAPI) {
 			runtime = await ConversationRuntime.connect(conversation, ownerId);
 			sandbox = new ConversationSandbox(conversation);
 			await sandbox.start();
-			liveConnection = await connectLive(
+			const useTelegramQueue =
+				conversation.service === "telegram" && String(pi.getFlag(CHAT_TELEGRAM_QUEUE_FLAG) ?? "") === "true";
+			liveConnection = await (useTelegramQueue ? connectTelegramQueuedLive : connectLive)(
 				conversation,
 				{
 					onMessage: async (input, checkpoint) => {
@@ -1101,6 +1202,9 @@ export default function (pi: ExtensionAPI) {
 	async function disconnectRuntime(ctx: ExtensionContext, clearPersistedState = true): Promise<void> {
 		stopTypingLoop();
 		stopWorkerStatusLoop();
+		const dispatcher = telegramDispatcher;
+		telegramDispatcher = undefined;
+		if (dispatcher) await dispatcher.disconnect().catch(() => undefined);
 		if (runtime) await writeWorkerStatus(ctx, "disconnected").catch(() => undefined);
 		const connection = liveConnection;
 		liveConnection = undefined;
@@ -1189,7 +1293,23 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`No configured channels. Run /chat-config. (${CHAT_CONFIG_PATH})`, "warning");
 				return;
 			}
-			const lines = configured.map((conversation) => spawnConversationTmux(ctx, conversation, restart));
+			const lines: string[] = [];
+			const telegramAccountIds = new Set<string>();
+			for (const conversation of configured) {
+				if (conversation.service === "telegram") telegramAccountIds.add(conversation.accountId);
+			}
+			for (const accountId of [...telegramAccountIds].sort()) {
+				const account = config.accounts[accountId];
+				if (!account || account.service !== "telegram") continue;
+				lines.push(spawnTelegramDispatcherTmux(ctx, accountId, account as TelegramAccountConfig, restart));
+			}
+			for (const conversation of configured) {
+				lines.push(
+					spawnConversationTmux(ctx, conversation, restart, {
+						telegramQueue: conversation.service === "telegram",
+					}),
+				);
+			}
 			ctx.ui.notify(`${lines.join("\n")}\n\nAttach with: tmux attach -t <session>`, "info");
 		},
 	});
@@ -1343,6 +1463,11 @@ export default function (pi: ExtensionAPI) {
 			"chat_workers",
 		]);
 		updateStatus(ctx);
+		const flaggedDispatcherAccountId = pi.getFlag(CHAT_TELEGRAM_DISPATCHER_FLAG);
+		if (typeof flaggedDispatcherAccountId === "string" && flaggedDispatcherAccountId.trim()) {
+			await connectTelegramDispatcherProcess(ctx, flaggedDispatcherAccountId.trim());
+			return;
+		}
 		const flaggedConversationId = pi.getFlag(CHAT_CONVERSATION_FLAG);
 		const persistedConversationId = getPersistedConversationId(ctx);
 		const conversationId =

@@ -95,6 +95,10 @@ export async function removeAccountStorage(accountId: string, _cwd: string): Pro
 	await rm(join(CHAT_CACHE_DIR, `${sanitizePathSegment(accountId)}.json`), { force: true });
 }
 
+export function getAccountRuntimePath(accountId: string, fileName: string): string {
+	return join(getAccountStorageDir(accountId), fileName);
+}
+
 export async function removeChannelStorage(accountId: string, channelKey: string, _cwd: string): Promise<void> {
 	await rm(getChannelStorageDir(accountId, channelKey), { recursive: true, force: true });
 }
@@ -125,6 +129,16 @@ export function listConfiguredConversations(config: ChatConfig): ResolvedConvers
 		for (const [channelKey, channel] of Object.entries(account.channels ?? {}) as Array<[string, ConfiguredChannel]>) {
 			conversations.push(buildResolvedConversation(config, accountId, channelKey, channel));
 		}
+	}
+	return conversations.sort((a, b) => a.conversationId.localeCompare(b.conversationId));
+}
+
+export function listConfiguredConversationsForAccount(config: ChatConfig, accountId: string): ResolvedConversation[] {
+	const account = config.accounts[accountId];
+	if (!account) return [];
+	const conversations: ResolvedConversation[] = [];
+	for (const [channelKey, channel] of Object.entries(account.channels ?? {}) as Array<[string, ConfiguredChannel]>) {
+		conversations.push(buildResolvedConversation(config, accountId, channelKey, channel));
 	}
 	return conversations.sort((a, b) => a.conversationId.localeCompare(b.conversationId));
 }
