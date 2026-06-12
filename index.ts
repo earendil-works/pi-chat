@@ -237,6 +237,32 @@ function formatChatSkillsForPrompt(skills: ChatPromptSkill[]): string {
 	return lines.join("\n");
 }
 
+// Matches the <available_skills> block that pi core injects into the system prompt from
+// the host's skills directories. In sandbox mode those host paths are unreachable inside
+// the Gondolin VM, so we strip the entire block (preamble + tags) and let pi-chat's own
+// buildSkillsPromptSuffix re-emit a VM-aware block with guest paths.
+//
+// We anchor only on the stable parts of pi's output: the "The following skills" preamble
+// opener and the "</available_skills>" closing tag (fixed by the Agent Skills spec). The
+// preamble's middle sentences are intentionally not matched, because pi ships more than one
+// skills formatter with diverging wording, so coupling to them would silently break on a pi
+// upgrade. The leading \n\n mirrors pi's exact block separator; if pi ever changes it the
+// strip no-ops, which before_agent_start detects and warns about rather than failing quietly.
+const HOST_SKILLS_BLOCK_RE = /\n\nThe following skills[\s\S]*?<\/available_skills>/;
+
+function adaptSystemPromptForSandbox(prompt: string): string {
+	// Note the asymmetry: the cwd rewrite is best-effort (a silent no-op if process.cwd()
+	// doesn't byte-match the embedded path), whereas the skills strip is guarded in
+	// before_agent_start. Both values come from this same Node process, so cwd drift is
+	// effectively impossible in practice.
+	return prompt
+		.replace(
+			`Current working directory: ${process.cwd()}`,
+			`Current working directory: ${GONDOLIN_WORKSPACE} (Gondolin VM; shared files at ${GONDOLIN_SHARED})`,
+		)
+		.replace(HOST_SKILLS_BLOCK_RE, "");
+}
+
 function tmuxSafeName(value: string): string {
 	const safe = value.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "") || "channel";
 	return `${WORKER_TMUX_PREFIX}${safe}`.slice(0, 100);
@@ -444,6 +470,9 @@ export default function (pi: ExtensionAPI) {
 	let workerStatusInterval: ReturnType<typeof setInterval> | undefined;
 	let queuedOutboundAttachments: string[] = [];
 	let pendingChatDispatch = false;
+	// Latches true after the first failed host-skills strip so the drift warning fires once per
+	// extension instance; intentionally not reset, since a surviving block always means broken output.
+	let warnedHostSkillsLeak = false;
 	let pendingControlAction: (() => Promise<void>) | undefined;
 	let activeTriggerMessageId: string | undefined;
 
@@ -1368,13 +1397,18 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("before_agent_start", async (event) => {
-		const systemPrompt = sandbox
-			? event.systemPrompt.replace(
-					`Current working directory: ${process.cwd()}`,
-					`Current working directory: ${GONDOLIN_WORKSPACE} (Gondolin VM; shared files at ${GONDOLIN_SHARED})`,
-				)
-			: event.systemPrompt;
+	pi.on("before_agent_start", async (event, ctx) => {
+		const systemPrompt = sandbox ? adaptSystemPromptForSandbox(event.systemPrompt) : event.systemPrompt;
+		// If pi changes its skills prompt format, the strip above silently no-ops and host paths
+		// leak into the VM. Detect the surviving host block (pi-chat's own block is appended later)
+		// and surface it once instead of failing quietly.
+		if (sandbox && !warnedHostSkillsLeak && systemPrompt.includes("<available_skills>")) {
+			warnedHostSkillsLeak = true;
+			ctx.ui.notify(
+				"pi-chat: could not strip the host skills block from the sandbox system prompt. pi's skills prompt format may have changed; host skill paths may leak into the VM. Update HOST_SKILLS_BLOCK_RE.",
+				"warning",
+			);
+		}
 		if (!pendingChatDispatch) return sandbox ? { systemPrompt } : undefined;
 		pendingChatDispatch = false;
 		const channelName = runtime?.conversation.channel.name ?? runtime?.conversation.channelKey ?? "chat";
