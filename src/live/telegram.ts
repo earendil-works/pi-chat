@@ -85,6 +85,26 @@ async function callTelegram<T>(
 	return data.result;
 }
 
+function isTelegramEntityParseError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	return error.message.toLowerCase().includes("can't parse entities");
+}
+
+async function sendMessageWithPlainTextFallback(
+	botToken: string,
+	body: Record<string, unknown>,
+	options?: { signal?: AbortSignal },
+): Promise<{ message_id: number }> {
+	try {
+		return await callTelegram<{ message_id: number }>(botToken, "sendMessage", body, options);
+	} catch (error) {
+		if (!body.parse_mode || !isTelegramEntityParseError(error)) throw error;
+		const fallbackBody = { ...body };
+		delete fallbackBody.parse_mode;
+		return await callTelegram<{ message_id: number }>(botToken, "sendMessage", fallbackBody, options);
+	}
+}
+
 async function downloadTelegramFile(
 	conversation: ResolvedConversation,
 	botToken: string,
@@ -335,9 +355,8 @@ export async function connectTelegramLive(
 				for (let i = 0; i < chunks.length; i++) {
 					const id = String(
 						(
-							await callTelegram<{ message_id: number }>(
+							await sendMessageWithPlainTextFallback(
 								account.botToken,
-								"sendMessage",
 								{
 									chat_id: Number(conversation.channel.id),
 									text: chunks[i],
