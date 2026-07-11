@@ -733,8 +733,10 @@ export default function (pi: ExtensionAPI) {
 						}
 						if (control === "new") {
 							const queueNewSession = async () => {
+								const dropped = runtime ? await runtime.clearPendingJobs("new-session") : 0;
 								pi.sendUserMessage("/chat-new", { deliverAs: "followUp" });
-								await liveConnection?.sendImmediate("Starting a new pi session.");
+								const clearedNote = dropped > 0 ? ` Cleared ${dropped} queued message${dropped === 1 ? "" : "s"}.` : "";
+								await liveConnection?.sendImmediate(`Starting a new pi session.${clearedNote}`);
 							};
 							if (chatTurnInFlight || !ctx.isIdle()) {
 								pendingControlAction = queueNewSession;

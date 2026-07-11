@@ -83,6 +83,12 @@ export interface JobFailedRecord extends ChatRecordBase {
 	triggerRecordId: number;
 	error: string;
 }
+export interface JobCancelledRecord extends ChatRecordBase {
+	type: "job_cancelled";
+	jobId: string;
+	triggerRecordId: number;
+	reason: string;
+}
 export interface ErrorRecord extends ChatRecordBase {
 	type: "error";
 	message: string;
@@ -95,6 +101,7 @@ export type ChatLogRecord =
 	| JobQueuedRecord
 	| JobCompletedRecord
 	| JobFailedRecord
+	| JobCancelledRecord
 	| ErrorRecord;
 
 export interface PendingJob {

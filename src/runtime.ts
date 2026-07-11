@@ -70,7 +70,7 @@ export class ConversationRuntime {
 	private records: ChatLogRecord[] = [];
 	private nextRecordId = 1;
 	private pendingJobs: PendingJob[] = [];
-	private activeJob: PendingJob | undefined;
+	private activeJobs: PendingJob[] = [];
 	private armedAfterRecordId: number | undefined;
 
 	constructor(conversation: ResolvedConversation, ownerId: string) {
@@ -237,12 +237,31 @@ export class ConversationRuntime {
 	}
 
 	beginNextJob(): DispatchableJob | undefined {
-		if (this.activeJob || this.pendingJobs.length === 0) return undefined;
-		const job = this.pendingJobs.shift();
-		if (!job) return undefined;
-		this.activeJob = job;
-		const triggerRecord = getLatestTriggerRecord(this.records, job);
-		return { job, prompt: this.buildPrompt(job), triggerMessageId: triggerRecord?.messageId };
+		if (this.activeJobs.length > 0 || this.pendingJobs.length === 0) return undefined;
+		// Coalesce every currently-pending job into a single turn. A burst of
+		// consecutive messages is answered together — the prompt spans all of them
+		// and the reply quotes the most recent — instead of draining serially and
+		// replying to each stale message one turn at a time.
+		const batch = this.pendingJobs.splice(0);
+		const primary = batch[batch.length - 1];
+		if (!primary) return undefined;
+		this.activeJobs = batch;
+		const triggerRecord = getLatestTriggerRecord(this.records, primary);
+		return { job: primary, prompt: this.buildPrompt(primary), triggerMessageId: triggerRecord?.messageId };
+	}
+
+	async clearPendingJobs(reason: string): Promise<number> {
+		const dropped = this.pendingJobs.splice(0);
+		for (const job of dropped) {
+			await this.appendRecord({
+				type: "job_cancelled",
+				...buildBaseRecordFields(this.conversation, this.nextRecordId),
+				jobId: job.jobId,
+				triggerRecordId: job.triggerRecordId,
+				reason,
+			});
+		}
+		return dropped.length;
 	}
 
 	private buildPrompt(job: PendingJob): string {
@@ -257,45 +276,50 @@ export class ConversationRuntime {
 	}
 
 	async completeActiveJob(text: string, remoteMessageId?: string, attachmentPaths?: string[]): Promise<void> {
-		const job = this.activeJob;
-		if (!job) return;
+		const jobs = this.activeJobs;
+		const primary = jobs[jobs.length - 1];
+		if (!primary) return;
 		let outboundRecordId: number | undefined;
 		const trimmed = text.trim();
 		if (trimmed.length > 0 || (attachmentPaths?.length ?? 0) > 0) {
-			const triggerRecord = getLatestTriggerRecord(this.records, job);
+			const triggerRecord = getLatestTriggerRecord(this.records, primary);
 			const outbound = {
 				type: "outbound",
 				...buildBaseRecordFields(this.conversation, this.nextRecordId),
 				messageId: remoteMessageId || nextMessageId(this.conversation.service),
 				text: trimmed,
 				replyToMessageId: triggerRecord?.messageId,
-				jobId: job.jobId,
+				jobId: primary.jobId,
 				attachments: attachmentPaths?.length ? [...attachmentPaths] : undefined,
 			} as const;
 			outboundRecordId = outbound.recordId;
 			await this.appendRecord(outbound);
 		}
-		await this.appendRecord({
-			type: "job_completed",
-			...buildBaseRecordFields(this.conversation, this.nextRecordId),
-			jobId: job.jobId,
-			triggerRecordId: job.triggerRecordId,
-			outboundRecordId,
-		});
-		this.activeJob = undefined;
+		for (const job of jobs) {
+			await this.appendRecord({
+				type: "job_completed",
+				...buildBaseRecordFields(this.conversation, this.nextRecordId),
+				jobId: job.jobId,
+				triggerRecordId: job.triggerRecordId,
+				outboundRecordId,
+			});
+		}
+		this.activeJobs = [];
 	}
 
 	async failActiveJob(error: string): Promise<void> {
-		const job = this.activeJob;
-		if (!job) return;
-		await this.appendRecord({
-			type: "job_failed",
-			...buildBaseRecordFields(this.conversation, this.nextRecordId),
-			jobId: job.jobId,
-			triggerRecordId: job.triggerRecordId,
-			error,
-		});
-		this.activeJob = undefined;
+		const jobs = this.activeJobs;
+		if (jobs.length === 0) return;
+		for (const job of jobs) {
+			await this.appendRecord({
+				type: "job_failed",
+				...buildBaseRecordFields(this.conversation, this.nextRecordId),
+				jobId: job.jobId,
+				triggerRecordId: job.triggerRecordId,
+				error,
+			});
+		}
+		this.activeJobs = [];
 	}
 
 	async appendError(message: string): Promise<void> {
@@ -325,7 +349,7 @@ export class ConversationRuntime {
 			conversationName: this.conversation.conversationName,
 			logPath: this.conversation.logPath,
 			queueLength: this.pendingJobs.length,
-			hasActiveJob: this.activeJob !== undefined,
+			hasActiveJob: this.activeJobs.length > 0,
 			recordCount: this.records.length,
 			lastRecordId: this.records.at(-1)?.recordId ?? 0,
 		};
