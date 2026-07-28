@@ -1,6 +1,6 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join, posix, resolve } from "node:path";
 
 import type {
 	AccessPolicy,
@@ -10,6 +10,7 @@ import type {
 	GondolinConfig,
 	GondolinSecretConfig,
 	ResolvedConversation,
+	ResolvedGondolinMount,
 } from "./core/config-types.js";
 
 export const CHAT_HOME = join(homedir(), ".pi", "agent", "chat");
@@ -50,6 +51,65 @@ function mergeGondolinSecrets(...configs: Array<GondolinConfig | undefined>): Re
 	return merged;
 }
 
+const RESERVED_GUEST_ROOTS = ["/workspace", "/shared"];
+
+function expandHomeDir(value: string): string {
+	if (value === "~") return homedir();
+	if (value.startsWith("~/")) return join(homedir(), value.slice(2));
+	return value;
+}
+
+function sanitizeGuestPathSegment(value: string): string {
+	return value.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "mount";
+}
+
+export function defaultMountGuestPath(hostPath: string): string {
+	const expanded = expandHomeDir(hostPath.trim());
+	return `/mnt/${sanitizeGuestPathSegment(basename(expanded.replace(/\/+$/, "")))}`;
+}
+
+function normalizeMountGuestPath(value: string): string {
+	return posix.resolve("/", value.trim());
+}
+
+function assertValidMountGuestPath(guestPath: string): void {
+	if (guestPath === "/") throw new Error("Gondolin mount guest path must not be the filesystem root");
+	for (const reserved of RESERVED_GUEST_ROOTS) {
+		if (guestPath === reserved || guestPath.startsWith(`${reserved}/`))
+			throw new Error(`Gondolin mount guest path must not overlap ${reserved}: ${guestPath}`);
+	}
+}
+
+/**
+ * Merge extra host directory mounts from global, account, and channel config.
+ * Later configs override earlier ones for the same guest path.
+ */
+export function resolveGondolinMounts(...configs: Array<GondolinConfig | undefined>): ResolvedGondolinMount[] {
+	const byGuestPath = new Map<string, ResolvedGondolinMount>();
+	for (const config of configs) {
+		for (const mount of config?.mounts ?? []) {
+			const rawHostPath = mount.hostPath?.trim() ?? "";
+			if (!rawHostPath) throw new Error("Gondolin mount host path must not be empty");
+			const hostPath = resolve(expandHomeDir(rawHostPath));
+			const guestPath = mount.guestPath?.trim()
+				? normalizeMountGuestPath(mount.guestPath)
+				: defaultMountGuestPath(rawHostPath);
+			assertValidMountGuestPath(guestPath);
+			byGuestPath.set(guestPath, { hostPath, guestPath, readOnly: mount.readOnly ?? false });
+		}
+	}
+	const mounts = [...byGuestPath.values()].sort((a, b) => a.guestPath.localeCompare(b.guestPath));
+	for (let i = 0; i < mounts.length; i++) {
+		for (let j = i + 1; j < mounts.length; j++) {
+			const a = mounts[i].guestPath;
+			const b = mounts[j].guestPath;
+			if (a.startsWith(`${b}/`) || b.startsWith(`${a}/`))
+				throw new Error(`Gondolin mount guest paths must not nest: ${a} and ${b}`);
+		}
+	}
+	return mounts;
+}
+
 function buildResolvedConversation(
 	config: ChatConfig,
 	accountId: string,
@@ -72,6 +132,7 @@ function buildResolvedConversation(
 		conversationName: `${account.name ?? accountId} / ${channel.name ?? channelKey}`,
 		access: mergeAccess(account.access, channel.access),
 		gondolinSecrets: mergeGondolinSecrets(config.gondolin, account.gondolin, channel.gondolin),
+		gondolinMounts: resolveGondolinMounts(config.gondolin, account.gondolin, channel.gondolin),
 		accountDir,
 		sharedDir: join(accountDir, "shared"),
 		conversationDir,

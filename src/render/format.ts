@@ -23,10 +23,12 @@ function normalizeDiscord(markdown: string): string {
 
 export function formatMarkdownForService(service: ChatService, markdown: string): RenderedChunkPayload {
 	if (service === "telegram") return { text: normalizeTelegram(markdown), parseMode: "Markdown" };
+	if (service === "feishu") return { text: markdown.replace(/\r\n/g, "\n").trim() };
 	return { text: normalizeDiscord(markdown) };
 }
 
 export function maxMessageLength(service: ChatService): number {
 	if (service === "telegram") return 4096;
+	if (service === "feishu") return 3500;
 	return 2000;
 }

@@ -3,9 +3,16 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, mkdir, open, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { createHttpHooks, RealFSProvider, type SecretDefinition, VM } from "@earendil-works/gondolin";
+import {
+	createHttpHooks,
+	ReadonlyProvider,
+	RealFSProvider,
+	type SecretDefinition,
+	type VirtualProvider,
+	VM,
+} from "@earendil-works/gondolin";
 
-import type { ResolvedConversation } from "./core/config-types.js";
+import type { ResolvedConversation, ResolvedGondolinMount } from "./core/config-types.js";
 import { ensureConversationDirs } from "./log.js";
 
 export const GONDOLIN_WORKSPACE = "/workspace";
@@ -18,12 +25,6 @@ function toPosix(value: string): string {
 function isInside(root: string, value: string): boolean {
 	const rel = path.relative(root, value);
 	return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-}
-
-function guestMountRoot(guestPath: string): typeof GONDOLIN_WORKSPACE | typeof GONDOLIN_SHARED | undefined {
-	if (guestPath === GONDOLIN_WORKSPACE || guestPath.startsWith(`${GONDOLIN_WORKSPACE}/`)) return GONDOLIN_WORKSPACE;
-	if (guestPath === GONDOLIN_SHARED || guestPath.startsWith(`${GONDOLIN_SHARED}/`)) return GONDOLIN_SHARED;
-	return undefined;
 }
 
 function resolveSecretEnvironment(conversation: ResolvedConversation): {
@@ -73,23 +74,37 @@ export class ConversationSandbox {
 		this.starting = (async () => {
 			await ensureConversationDirs(this.conversation);
 			const secretConfig = resolveSecretEnvironment(this.conversation);
+			const mounts: Record<string, VirtualProvider> = {
+				[GONDOLIN_WORKSPACE]: new RealFSProvider(this.conversation.workspaceDir),
+				[GONDOLIN_SHARED]: new RealFSProvider(this.conversation.sharedDir),
+			};
+			for (const mount of this.conversation.gondolinMounts) {
+				const hostStats = await stat(mount.hostPath).catch(() => undefined);
+				if (!hostStats?.isDirectory())
+					throw new Error(`Gondolin mount host path is not a directory: ${mount.hostPath} (${mount.guestPath})`);
+				const provider: VirtualProvider = new RealFSProvider(mount.hostPath);
+				mounts[mount.guestPath] = mount.readOnly ? new ReadonlyProvider(provider) : provider;
+			}
 			const vm = await VM.create({
 				sessionLabel: `pi-chat ${this.conversation.conversationName}`,
 				env: secretConfig.env,
 				httpHooks: secretConfig.httpHooks,
-				vfs: {
-					mounts: {
-						[GONDOLIN_WORKSPACE]: new RealFSProvider(this.conversation.workspaceDir),
-						[GONDOLIN_SHARED]: new RealFSProvider(this.conversation.sharedDir),
-					},
-				},
+				vfs: { mounts },
 			});
 			await vm.exec("command -v bash > /dev/null 2>&1 || apk add --no-cache bash > /dev/null 2>&1 || true");
 			this.vm = vm;
 			this.starting = undefined;
 			await writeFile(
 				path.join(this.conversation.gondolinDir, "session.json"),
-				`${JSON.stringify({ vmId: vm.id, secretNames: secretConfig.configuredSecretNames }, null, "\t")}\n`,
+				`${JSON.stringify(
+					{
+						vmId: vm.id,
+						secretNames: secretConfig.configuredSecretNames,
+						mounts: this.conversation.gondolinMounts,
+					},
+					null,
+					"\t",
+				)}\n`,
 				"utf8",
 			);
 			return vm;
@@ -104,12 +119,39 @@ export class ConversationSandbox {
 		if (vm) await vm.close();
 	}
 
+	private mountRoots(): ResolvedGondolinMount[] {
+		return [
+			{ guestPath: GONDOLIN_WORKSPACE, hostPath: this.conversation.workspaceDir, readOnly: false },
+			{ guestPath: GONDOLIN_SHARED, hostPath: this.conversation.sharedDir, readOnly: false },
+			...this.conversation.gondolinMounts,
+		];
+	}
+
+	private resolvedMountRoots(): Array<ResolvedGondolinMount & { resolvedHostPath: string }> {
+		return this.mountRoots()
+			.map((mount) => ({ ...mount, resolvedHostPath: realpathSync(mount.hostPath) }))
+			.sort((a, b) => b.resolvedHostPath.length - a.resolvedHostPath.length);
+	}
+
+	private findMountForGuestPath(guestPath: string): ResolvedGondolinMount | undefined {
+		return this.mountRoots().find(
+			(mount) => guestPath === mount.guestPath || guestPath.startsWith(`${mount.guestPath}/`),
+		);
+	}
+
 	private resolveGuestPath(inputPath: string): string {
 		const trimmed = inputPath.trim();
 		if (!trimmed) throw new Error("Path must not be empty");
 		const base = trimmed.startsWith("/") ? "/" : GONDOLIN_WORKSPACE;
 		const guestPath = path.posix.resolve(base, trimmed);
-		if (!guestMountRoot(guestPath)) throw new Error(`Path is outside mounted storage: ${inputPath}`);
+		if (!this.findMountForGuestPath(guestPath)) throw new Error(`Path is outside mounted storage: ${inputPath}`);
+		return guestPath;
+	}
+
+	private resolveWritableGuestPath(inputPath: string): string {
+		const guestPath = this.resolveGuestPath(inputPath);
+		const mount = this.findMountForGuestPath(guestPath);
+		if (mount?.readOnly) throw new Error(`Path is on a read-only mount (${mount.guestPath}): ${inputPath}`);
 		return guestPath;
 	}
 
@@ -136,21 +178,11 @@ export class ConversationSandbox {
 
 	guestToHostPath(inputPath: string): string {
 		const guestPath = this.resolveGuestPath(inputPath);
-		const mountRoot = guestMountRoot(guestPath);
-		let hostRoot: string;
-		let hostPath: string;
-		if (mountRoot === GONDOLIN_WORKSPACE) {
-			const relativePath = path.posix.relative(GONDOLIN_WORKSPACE, guestPath);
-			hostRoot = this.conversation.workspaceDir;
-			hostPath = path.join(hostRoot, ...relativePath.split("/").filter(Boolean));
-		} else if (mountRoot === GONDOLIN_SHARED) {
-			const relativePath = path.posix.relative(GONDOLIN_SHARED, guestPath);
-			hostRoot = this.conversation.sharedDir;
-			hostPath = path.join(hostRoot, ...relativePath.split("/").filter(Boolean));
-		} else {
-			throw new Error(`Path is outside mounted storage: ${inputPath}`);
-		}
-		const resolvedRoot = realpathSync(hostRoot);
+		const mount = this.findMountForGuestPath(guestPath);
+		if (!mount) throw new Error(`Path is outside mounted storage: ${inputPath}`);
+		const relativePath = path.posix.relative(mount.guestPath, guestPath);
+		const hostPath = path.join(mount.hostPath, ...relativePath.split("/").filter(Boolean));
+		const resolvedRoot = realpathSync(mount.hostPath);
 		const resolvedHostPath = realpathSync(hostPath);
 		if (!isInside(resolvedRoot, resolvedHostPath)) throw new Error(`Path is outside mounted storage: ${inputPath}`);
 		return resolvedHostPath;
@@ -158,24 +190,18 @@ export class ConversationSandbox {
 
 	private assertMountedHostPath(hostPath: string): string {
 		const resolved = realpathSync(hostPath);
-		const workspaceRoot = realpathSync(this.conversation.workspaceDir);
-		if (isInside(workspaceRoot, resolved)) return resolved;
-		const sharedRoot = realpathSync(this.conversation.sharedDir);
-		if (isInside(sharedRoot, resolved)) return resolved;
+		for (const mount of this.resolvedMountRoots()) {
+			if (isInside(mount.resolvedHostPath, resolved)) return resolved;
+		}
 		throw new Error(`Path is outside mounted storage: ${hostPath}`);
 	}
 
 	hostToGuestPath(hostPath: string): string {
 		const resolved = this.assertMountedHostPath(hostPath);
-		const workspaceRoot = realpathSync(this.conversation.workspaceDir);
-		if (isInside(workspaceRoot, resolved)) {
-			const relativePath = toPosix(path.relative(workspaceRoot, resolved));
-			return relativePath ? path.posix.join(GONDOLIN_WORKSPACE, relativePath) : GONDOLIN_WORKSPACE;
-		}
-		const sharedRoot = realpathSync(this.conversation.sharedDir);
-		if (isInside(sharedRoot, resolved)) {
-			const relativePath = toPosix(path.relative(sharedRoot, resolved));
-			return relativePath ? path.posix.join(GONDOLIN_SHARED, relativePath) : GONDOLIN_SHARED;
+		for (const mount of this.resolvedMountRoots()) {
+			if (!isInside(mount.resolvedHostPath, resolved)) continue;
+			const relativePath = toPosix(path.relative(mount.resolvedHostPath, resolved));
+			return relativePath ? path.posix.join(mount.guestPath, relativePath) : mount.guestPath;
 		}
 		throw new Error(`Path is outside mounted storage: ${hostPath}`);
 	}
@@ -206,11 +232,11 @@ export class ConversationSandbox {
 		const vm = await this.start();
 		return {
 			writeFile: async (guestPath: string, content: string) => {
-				const resolvedPath = this.resolveGuestPath(guestPath);
+				const resolvedPath = this.resolveWritableGuestPath(guestPath);
 				await vm.fs.writeFile(resolvedPath, content);
 			},
 			mkdir: async (guestPath: string) => {
-				const resolvedPath = this.resolveGuestPath(guestPath);
+				const resolvedPath = this.resolveWritableGuestPath(guestPath);
 				await vm.fs.mkdir(resolvedPath, { recursive: true });
 			},
 		};
@@ -224,7 +250,7 @@ export class ConversationSandbox {
 				return vm.fs.readFile(resolvedPath);
 			},
 			writeFile: async (guestPath: string, content: string) => {
-				const resolvedPath = this.resolveGuestPath(guestPath);
+				const resolvedPath = this.resolveWritableGuestPath(guestPath);
 				await vm.fs.writeFile(resolvedPath, content);
 			},
 			access: async (guestPath: string) => {

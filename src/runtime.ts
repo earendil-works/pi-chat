@@ -151,7 +151,7 @@ export class ConversationRuntime {
 		const aliases = [this.conversation.botName, "botUsername" in account ? account.botUsername : undefined].filter(
 			Boolean,
 		);
-		for (const alias of aliases) text = text.replace(new RegExp(`@${escapeRegExp(alias || "")}\\b`, "ig"), " ");
+		for (const alias of aliases) text = text.replace(new RegExp(`@${escapeRegExp(alias || "")}`, "ig"), " ");
 		const command = text.replace(/\s+/g, " ").trim().toLowerCase();
 		if (command === "stop" || command === "/stop") return "stop";
 		if (command === "new" || command === "/new") return "new";

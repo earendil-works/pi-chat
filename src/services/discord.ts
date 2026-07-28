@@ -79,6 +79,7 @@ export function buildDiscordInviteUrl(applicationId: string): string {
 export const discordDiscoveryProvider: DiscoveryProvider = {
 	service: "discord",
 	async validate(draft: AccountDraft): Promise<AccountValidationResult> {
+		if (draft.service !== "discord") throw new Error("Invalid Discord account draft");
 		return withDiscordClient(draft.botToken, async (client) => ({
 			identity: {
 				id: client.user.id,

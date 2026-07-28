@@ -1,4 +1,4 @@
-export type ChatService = "telegram" | "discord";
+export type ChatService = "telegram" | "discord" | "feishu";
 
 export type TriggerMode = "mention" | "message";
 
@@ -14,8 +14,24 @@ export interface GondolinSecretConfig {
 	hosts: string[];
 }
 
+export interface GondolinMountConfig {
+	/** Host directory to expose inside the VM. "~" is expanded to the home directory. */
+	hostPath: string;
+	/** Absolute path inside the VM. Defaults to /mnt/<host directory name>. */
+	guestPath?: string;
+	/** Mount read-only when true. */
+	readOnly?: boolean;
+}
+
 export interface GondolinConfig {
 	secrets?: Record<string, GondolinSecretConfig>;
+	mounts?: GondolinMountConfig[];
+}
+
+export interface ResolvedGondolinMount {
+	hostPath: string;
+	guestPath: string;
+	readOnly: boolean;
 }
 
 export interface ConfiguredChannel {
@@ -51,7 +67,16 @@ export interface DiscordAccountConfig extends BaseAccountConfig {
 	botUsername?: string;
 }
 
-export type ChatAccountConfig = TelegramAccountConfig | DiscordAccountConfig;
+export interface FeishuAccountConfig extends BaseAccountConfig {
+	service: "feishu";
+	appId: string;
+	appSecret: string;
+	receiveMode?: "auto" | "websocket" | "polling";
+	botUserId?: string;
+	botUsername?: string;
+}
+
+export type ChatAccountConfig = TelegramAccountConfig | DiscordAccountConfig | FeishuAccountConfig;
 
 export interface ChatConfig {
 	botName?: string;
@@ -70,6 +95,7 @@ export interface ResolvedConversation {
 	conversationName: string;
 	access: AccessPolicy;
 	gondolinSecrets: Record<string, GondolinSecretConfig>;
+	gondolinMounts: ResolvedGondolinMount[];
 	accountDir: string;
 	sharedDir: string;
 	conversationDir: string;
