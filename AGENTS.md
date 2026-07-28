@@ -107,7 +107,7 @@ Discord/Telegram/Feishu ←→ Live Adapter ←→ Runtime (log, jobs, slices) �
 
 ## Remote control commands
 
-Parsed by `ConversationRuntime.parseControlCommand()`: `stop`, `new`, `compact`, `status`. Handled before normal ingest in the `onMessage` path.
+Parsed by `ConversationRuntime.parseControlCommand()`: `stop`, `new`, `compact`, `status`, `model`. Handled before normal ingest in the `onMessage` path. `model` (no args) lists available models; `model <provider/id|name>` switches the active model via `pi.setModel()`.
 
 ## Secret exchange flow
 

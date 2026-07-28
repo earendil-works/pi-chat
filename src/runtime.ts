@@ -23,6 +23,13 @@ import {
 	releaseConversationLock,
 } from "./log.js";
 
+export type ControlCommand =
+	| { command: "stop" }
+	| { command: "new" }
+	| { command: "compact" }
+	| { command: "status" }
+	| { command: "model"; query: string };
+
 function isDMConversation(conversation: ResolvedConversation): boolean {
 	return conversation.channel.dm ?? false;
 }
@@ -141,7 +148,7 @@ export class ConversationRuntime {
 		return this.isAllowedInput(message);
 	}
 
-	parseControlCommand(input: InboundMessageInput): "stop" | "new" | "compact" | "status" | undefined {
+	parseControlCommand(input: InboundMessageInput): ControlCommand | undefined {
 		const normalized = normalizeInboundMessage(input, this.conversation.botName);
 		if (!this.isAllowedInput(normalized)) return undefined;
 		const account = this.conversation.account;
@@ -152,16 +159,22 @@ export class ConversationRuntime {
 			Boolean,
 		);
 		for (const alias of aliases) text = text.replace(new RegExp(`@${escapeRegExp(alias || "")}`, "ig"), " ");
-		const command = text.replace(/\s+/g, " ").trim().toLowerCase();
-		if (command === "stop" || command === "/stop") return "stop";
-		if (command === "new" || command === "/new") return "new";
-		if (command === "compact" || command === "/compact") return "compact";
-		if (command === "status" || command === "/status") return "status";
+		const trimmed = text.replace(/\s+/g, " ").trim();
+		const lower = trimmed.toLowerCase();
+		if (lower === "stop" || lower === "/stop") return { command: "stop" };
+		if (lower === "new" || lower === "/new") return { command: "new" };
+		if (lower === "compact" || lower === "/compact") return { command: "compact" };
+		if (lower === "status" || lower === "/status") return { command: "status" };
+		const modelMatch = /^\/?model(?:\s+(.*))?$/i.exec(trimmed);
+		if (modelMatch) {
+			const query = (modelMatch[1] ?? "").trim();
+			return { command: "model", query };
+		}
 		return undefined;
 	}
 
 	matchesStopCommand(input: InboundMessageInput): boolean {
-		return this.parseControlCommand(input) === "stop";
+		return this.parseControlCommand(input)?.command === "stop";
 	}
 
 	private shouldTriggerJob(message: InboundMessageRecord): false | "mention" | "dm" {

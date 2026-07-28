@@ -662,6 +662,46 @@ export default function (pi: ExtensionAPI) {
 		return lines.join("\n") || "No usage data yet.";
 	}
 
+	async function handleModelCommand(ctx: ExtensionContext, query: string): Promise<string> {
+		const models = ctx.modelRegistry.getAvailable();
+		if (!query) {
+			const current = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
+			const lines = [`Current model: ${current}`, "", "Available models:"];
+			for (const model of models) {
+				const marker = ctx.model?.provider === model.provider && ctx.model?.id === model.id ? " ← current" : "";
+				lines.push(`- ${model.provider}/${model.id}${marker}`);
+			}
+			return lines.join("\n") || "No models available.";
+		}
+		const lower = query.toLowerCase();
+		let matches = models.filter((m) => `${m.provider}/${m.id}`.toLowerCase() === lower);
+		if (matches.length === 0) matches = models.filter((m) => m.id.toLowerCase() === lower);
+		if (matches.length === 0) {
+			matches = models.filter(
+				(m) =>
+					m.id.toLowerCase().includes(lower) ||
+					m.name.toLowerCase().includes(lower) ||
+					m.provider.toLowerCase().includes(lower),
+			);
+		}
+		if (matches.length === 0) {
+			return `No model matched "${query}". Send "model" (no arguments) to list available models.`;
+		}
+		if (matches.length > 1) {
+			const list = matches.map((m) => `- ${m.provider}/${m.id}`).join("\n");
+			return `Multiple models matched "${query}":\n${list}\n\nSend "model <provider/id>" to be more specific.`;
+		}
+		const target = matches[0];
+		if (target.provider === ctx.model?.provider && target.id === ctx.model?.id) {
+			return `Already using ${target.provider}/${target.id}.`;
+		}
+		const ok = await pi.setModel(target);
+		if (!ok) {
+			return `Could not switch to ${target.provider}/${target.id}: no API key configured for this provider.`;
+		}
+		return `Switched model to ${target.provider}/${target.id}.`;
+	}
+
 	async function restartSandbox(ctx: ExtensionContext, conversationId: string): Promise<boolean> {
 		const config = await loadChatConfig();
 		const conversation = resolveConversation(config, conversationId);
@@ -739,7 +779,7 @@ export default function (pi: ExtensionAPI) {
 						}
 						const control = runtime.isArmed() ? runtime.parseControlCommand(input) : undefined;
 						if (control && checkpoint) await runtime.noteCheckpoint(checkpoint);
-						if (control === "stop") {
+						if (control?.command === "stop") {
 							if (chatTurnInFlight || !ctx.isIdle()) {
 								ctx.abort();
 								await liveConnection?.sendImmediate("Aborted current turn.");
@@ -748,7 +788,7 @@ export default function (pi: ExtensionAPI) {
 							}
 							return;
 						}
-						if (control === "compact") {
+						if (control?.command === "compact") {
 							const runCompact = async () => {
 								ctx.compact({
 									onComplete: () => void liveConnection?.sendImmediate("Compaction completed."),
@@ -765,11 +805,15 @@ export default function (pi: ExtensionAPI) {
 							await runCompact();
 							return;
 						}
-						if (control === "status") {
+						if (control?.command === "status") {
 							await liveConnection?.sendImmediate(buildRemoteStatus(ctx));
 							return;
 						}
-						if (control === "new") {
+						if (control?.command === "model") {
+							await liveConnection?.sendImmediate(await handleModelCommand(ctx, control.query));
+							return;
+						}
+						if (control?.command === "new") {
 							const queueNewSession = async () => {
 								startRemoteNewSession(ctx);
 								await liveConnection?.sendImmediate("Started a new pi session.");
