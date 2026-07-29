@@ -497,6 +497,8 @@ async function connectFeishuWebSocketLive(
 			if (!caughtUp) buffered.push(message);
 			else enqueue(message);
 		},
+		// Feishu emits this when a user reads a bot DM. pi-chat does not need read receipts.
+		"im.message.message_read_v1": () => undefined,
 	});
 	let connectedOnce = false;
 	const wsClient = new Lark.WSClient({

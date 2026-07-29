@@ -84,6 +84,7 @@ Skills:
   description: Short description of what this skill does
   ---
 - Available skills are listed in your prompt. To use a skill, read its full .md file first, then follow its instructions.
+- Hidden skills may be stored in /shared/hidden-skills/ or /workspace/hidden-skills/. They use the same format as regular skills but are never listed or auto-loaded. Only read one when the user explicitly asks to use/call a hidden skill (including equivalent Chinese requests such as "使用隐藏技能") or names its file/path.
 
 Attachments in the transcript are local file paths. Read them as needed.
 To send files back, write them under /workspace and use chat_attach.
@@ -454,6 +455,7 @@ export default function (pi: ExtensionAPI) {
 	let configLoadedAtLeastOnce = false;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let workerStatusInterval: ReturnType<typeof setInterval> | undefined;
+	let dispatchRetryTimer: ReturnType<typeof setTimeout> | undefined;
 	let queuedOutboundAttachments: string[] = [];
 	let pendingChatDispatch = false;
 	let pendingControlAction: (() => Promise<void>) | undefined;
@@ -1160,7 +1162,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	async function tryDispatch(ctx: ExtensionContext): Promise<void> {
-		if (!runtime || chatTurnInFlight || !ctx.isIdle()) return;
+		if (!runtime || chatTurnInFlight) return;
+		if (!ctx.isIdle()) {
+			// agent_end runs before pi flips the context back to idle.
+			scheduleDispatchRetry(ctx);
+			return;
+		}
 		const next = runtime.beginNextJob();
 		if (!next) {
 			updateStatus(ctx);
@@ -1185,9 +1192,21 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	function scheduleDispatchRetry(ctx: ExtensionContext): void {
+		if (dispatchRetryTimer || !runtime || chatTurnInFlight || runtime.getStatus().queueLength === 0) return;
+		dispatchRetryTimer = setTimeout(() => {
+			dispatchRetryTimer = undefined;
+			void tryDispatch(ctx);
+		}, 10);
+	}
+
 	async function disconnectRuntime(ctx: ExtensionContext, clearPersistedState = true): Promise<void> {
 		stopTypingLoop();
 		stopWorkerStatusLoop();
+		if (dispatchRetryTimer) {
+			clearTimeout(dispatchRetryTimer);
+			dispatchRetryTimer = undefined;
+		}
 		if (runtime) await writeWorkerStatus(ctx, "disconnected").catch(() => undefined);
 		const connection = liveConnection;
 		liveConnection = undefined;

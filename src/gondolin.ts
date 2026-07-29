@@ -27,21 +27,35 @@ function isInside(root: string, value: string): boolean {
 	return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
+function stripRegeneratedContentLength(request: Request): Request {
+	if (!request.headers.has("content-length")) return request;
+	const headers = new Headers(request.headers);
+	headers.delete("content-length");
+	return new Request(request, { headers });
+}
+
 function resolveSecretEnvironment(conversation: ResolvedConversation): {
 	env?: Record<string, string>;
 	httpHooks?: ReturnType<typeof createHttpHooks>["httpHooks"];
 	configuredSecretNames: string[];
 } {
 	const configuredSecretNames = Object.keys(conversation.gondolinSecrets);
-	if (configuredSecretNames.length === 0) return { configuredSecretNames };
 	const secrets: Record<string, SecretDefinition> = {};
 	for (const [name, secret] of Object.entries(conversation.gondolinSecrets)) {
 		if (!secret.value.trim()) throw new Error(`Gondolin secret ${name} must have a value`);
 		if (secret.hosts.length === 0) throw new Error(`Gondolin secret ${name} must declare at least one host`);
 		secrets[name] = { hosts: [...secret.hosts], value: secret.value };
 	}
-	const { env, httpHooks } = createHttpHooks({ allowedHosts: ["*"], secrets });
-	return { env, httpHooks, configuredSecretNames };
+	const { env, httpHooks } = createHttpHooks({
+		allowedHosts: ["*"],
+		secrets,
+		onRequest: stripRegeneratedContentLength,
+	});
+	return {
+		env: Object.keys(env).length > 0 ? env : undefined,
+		httpHooks,
+		configuredSecretNames,
+	};
 }
 
 async function walk(

@@ -160,12 +160,13 @@ export class ConversationRuntime {
 		);
 		for (const alias of aliases) text = text.replace(new RegExp(`@${escapeRegExp(alias || "")}`, "ig"), " ");
 		const trimmed = text.replace(/\s+/g, " ").trim();
+		if (!trimmed.startsWith("/")) return undefined;
 		const lower = trimmed.toLowerCase();
-		if (lower === "stop" || lower === "/stop") return { command: "stop" };
-		if (lower === "new" || lower === "/new") return { command: "new" };
-		if (lower === "compact" || lower === "/compact") return { command: "compact" };
-		if (lower === "status" || lower === "/status") return { command: "status" };
-		const modelMatch = /^\/?model(?:\s+(.*))?$/i.exec(trimmed);
+		if (lower === "/stop") return { command: "stop" };
+		if (lower === "/new") return { command: "new" };
+		if (lower === "/compact") return { command: "compact" };
+		if (lower === "/status") return { command: "status" };
+		const modelMatch = /^\/model(?:\s+(.*))?$/i.exec(trimmed);
 		if (modelMatch) {
 			const query = (modelMatch[1] ?? "").trim();
 			return { command: "model", query };
