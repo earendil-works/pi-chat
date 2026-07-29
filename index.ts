@@ -1239,7 +1239,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("chat-config", {
-		description: "Configure pi-chat Discord, Telegram, and Feishu accounts and channels",
+		description: "Configure pi-chat Discord, Telegram, Feishu, and Weixin accounts and channels",
 		handler: async (_args, ctx) => {
 			await loadConfigOnce();
 			const conversationId = runtime?.conversation.conversationId;

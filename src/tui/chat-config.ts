@@ -19,6 +19,7 @@ import type {
 	GondolinMountConfig,
 	GondolinSecretConfig,
 	TelegramAccountConfig,
+	WeixinAccountConfig,
 } from "../core/config-types.js";
 import type { DiscoveredChannel, DiscoveredRole, DiscoveredUser, DiscoverySnapshot } from "../core/discovery-types.js";
 import { makeChannelKey } from "../core/keys.js";
@@ -28,6 +29,7 @@ import { selectItem, showNotice, toggleItems } from "./dialogs.js";
 import { createDiscordAccountWithGuidedSetup } from "./discord-setup.js";
 import { addFeishuObservedTargetToAccount, createFeishuAccountWithGuidedSetup } from "./feishu-setup.js";
 import { addTelegramObservedTargetToAccount, createTelegramAccountWithGuidedSetup } from "./telegram-setup.js";
+import { addWeixinObservedTargetToAccount, createWeixinAccountWithGuidedSetup } from "./weixin-setup.js";
 
 function accountDescription(account: ChatAccountConfig, snapshot: DiscoverySnapshot | undefined): string {
 	const parts: string[] = [account.service];
@@ -660,6 +662,72 @@ async function configureFeishuAccount(ctx: ExtensionContext, accountId: string):
 	}
 }
 
+async function configureWeixinAccount(ctx: ExtensionContext, accountId: string): Promise<void> {
+	while (true) {
+		const config = await loadChatConfig();
+		const account = config.accounts[accountId] as WeixinAccountConfig | undefined;
+		if (!account || account.service !== "weixin") return;
+		const channelChoices = Object.entries(account.channels).map(([key, channel]) => ({
+			value: key,
+			label: key,
+			description: `${channel.name ?? channel.id} • direct message`,
+		}));
+		const choice = await selectItem(ctx, `${accountId} (${account.botUserId})`, [
+			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
+			{ value: "mounts", label: "Mounts", description: mountSummary(account.gondolin) },
+			{ value: "add-dm", label: "Add DM", description: "Pair a direct chat by observing a new message" },
+			{ value: "refresh", label: "Refresh account info" },
+			{
+				value: "delete",
+				label: "Delete account",
+				description: "Remove account and all configured direct-message channels",
+			},
+			...channelChoices,
+			{ value: "back", label: "Back" },
+		]);
+		if (!choice || choice === "back") return;
+		if (choice === "secrets") {
+			await configureSecrets(ctx, `${accountId} secrets`, account.gondolin, async (next) => {
+				account.gondolin = next;
+				config.accounts[accountId] = account;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
+		if (choice === "mounts") {
+			await configureMounts(ctx, `${accountId} mounts`, account.gondolin, async (next) => {
+				account.gondolin = next;
+				config.accounts[accountId] = account;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
+		if (choice === "add-dm") {
+			await addWeixinObservedTargetToAccount(ctx, config, accountId, account);
+			continue;
+		}
+		if (choice === "refresh") {
+			const fresh = await refreshAccountSnapshot(accountId, account);
+			config.accounts[accountId] = updateAccountIdentityFromSnapshot(account, fresh);
+			await saveChatConfig(config);
+			if ((fresh.warnings?.length ?? 0) > 0) {
+				await showNotice(ctx, "Refresh warnings", (fresh.warnings ?? []).join("\n"), "warning");
+			}
+			continue;
+		}
+		if (choice === "delete") {
+			const ok = await ctx.ui.confirm("Delete account", `Delete ${accountId} and all configured channels?`);
+			if (!ok) continue;
+			delete config.accounts[accountId];
+			await saveChatConfig(config);
+			await removeAccountStorage(accountId, ctx.cwd);
+			await showNotice(ctx, "Account deleted", `Deleted ${accountId}`, "info");
+			return;
+		}
+		await configureConfiguredChannel(ctx, config, accountId, choice);
+	}
+}
+
 async function configureAccount(ctx: ExtensionContext, accountId: string): Promise<void> {
 	const config = await loadChatConfig();
 	const account = config.accounts[accountId];
@@ -667,6 +735,7 @@ async function configureAccount(ctx: ExtensionContext, accountId: string): Promi
 	if (account.service === "discord") return configureDiscordAccount(ctx, accountId);
 	if (account.service === "telegram") return configureTelegramAccount(ctx, accountId);
 	if (account.service === "feishu") return configureFeishuAccount(ctx, accountId);
+	if (account.service === "weixin") return configureWeixinAccount(ctx, accountId);
 }
 
 export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
@@ -689,7 +758,11 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 				label: accountId,
 				description: accountDescription(config.accounts[accountId], snapshot),
 			})),
-			{ value: "__create__", label: "+ Create account", description: "Create a Telegram, Discord, or Feishu account" },
+			{
+				value: "__create__",
+				label: "+ Create account",
+				description: "Create a Telegram, Discord, Feishu, or Weixin account",
+			},
 		]);
 		if (!choice) return;
 		if (choice === "__secrets__") {
@@ -711,6 +784,7 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 				{ value: "telegram", label: "Telegram" },
 				{ value: "discord", label: "Discord" },
 				{ value: "feishu", label: "Feishu" },
+				{ value: "weixin", label: "Weixin", description: "Personal WeChat direct messages via iLink QR login" },
 			]);
 			if (!serviceChoice) continue;
 			if (serviceChoice === "telegram") {
@@ -720,6 +794,11 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 			}
 			if (serviceChoice === "feishu") {
 				const accountId = await createFeishuAccountWithGuidedSetup(ctx, config);
+				if (accountId) await configureAccount(ctx, accountId);
+				continue;
+			}
+			if (serviceChoice === "weixin") {
+				const accountId = await createWeixinAccountWithGuidedSetup(ctx, config);
 				if (accountId) await configureAccount(ctx, accountId);
 				continue;
 			}

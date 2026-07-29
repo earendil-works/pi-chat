@@ -1,6 +1,6 @@
 # pi-chat
 
-一个将 Discord、Telegram 和飞书会话连接到沙箱化 pi 会话的扩展。每个已连接的频道都会获得独立的 [Gondolin](https://github.com/earendil-works/gondolin) 微型虚拟机，并拥有持久化工作区、共享存储、记忆和技能。
+一个将 Discord、Telegram、飞书和微信会话连接到沙箱化 pi 会话的扩展。每个已连接的频道都会获得独立的 [Gondolin](https://github.com/earendil-works/gondolin) 微型虚拟机，并拥有持久化工作区、共享存储、记忆和技能。
 
 ## 快速开始
 
@@ -21,14 +21,14 @@ pi -e /path/to/pi-chat
 
 - 已安装 [QEMU](https://www.qemu.org/)；macOS 可运行 `brew install qemu`
 - Gondolin 客体镜像；首次连接时会自动下载
-- Discord Bot Token、Telegram Bot Token，或飞书应用的 App ID 与 App Secret
+- Discord Bot Token、Telegram Bot Token、飞书应用的 App ID 与 App Secret，或可扫码登录的微信 iLink 账号
 - 使用多频道 worker 编排功能时需要安装 `tmux`
 
 ---
 
 ## 功能
 
-- 支持 **Discord 服务器频道**、**Telegram 私聊/群组**和**飞书私聊/群组**
+- 支持 **Discord 服务器频道**、**Telegram 私聊/群组**、**飞书私聊/群组**和**微信私聊**
 - **每条连接独立的 Gondolin VM 沙箱**：工具在隔离的 Alpine Linux 微型虚拟机中运行
 - **持久化工作区与共享存储**：重连或重启后仍可继续使用
 - **流式预览回复**：生成过程中原地编辑预览消息
@@ -95,6 +95,25 @@ pi -e /path/to/pi-chat
 | `History polling` | 支持同一飞书应用运行多个独立频道 worker，但需要历史消息读取权限 |
 
 不建议让同一个飞书应用的多个 worker 强制使用 WebSocket。飞书长连接采用集群投递，同一事件只会发送给其中一个已连接客户端，而不是广播给全部客户端。
+
+---
+
+### 微信
+
+微信接入原生运行在 pi-chat 中，不依赖 OpenClaw。它通过腾讯 iLink bot 接口完成扫码登录、长轮询收消息和上下文回复。
+
+1. 运行 `/chat-config`，依次选择 **Create account → Weixin**
+2. 配置界面会直接显示可扫码的终端二维码；如果服务返回内嵌图片，也会写入 `~/.pi/agent/chat/cache/`，可按显示的路径打开
+3. 创建账号后选择 **Add DM**
+4. 从要接入的微信私聊向 bot 发送一条新消息，pi-chat 会将该会话配对为一个频道
+5. 运行 `/chat-connect` 或 `/chat-spawn-all` 连接已配对的会话
+
+#### 微信能力与限制
+
+- 仅支持 **一对一私聊**；不支持群聊、联系人枚举或读取既有聊天记录
+- 每次出站回复使用入站消息的 `context_token`，因此应先由对端发起或发送一条新消息
+- 支持文本、图片、文件和视频附件的收发；可接收微信语音附件（原始格式可能为 SILK），发送语音会作为普通文件
+- 一个 iLink bot 的消息拉取队列不适合多个独立 worker 并发消费。对于同一个微信账号，建议一次只连接一个已配置 DM
 
 ---
 

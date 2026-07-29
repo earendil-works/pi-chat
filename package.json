@@ -24,6 +24,7 @@
 		"@earendil-works/gondolin": "^0.12.0",
 		"@larksuiteoapi/node-sdk": "^1.71.1",
 		"discord.js": "^14.26.3",
+		"qrcode-terminal": "^0.12.0",
 		"remend": "^1.3.0",
 		"ws": "^8.18.3"
 	},

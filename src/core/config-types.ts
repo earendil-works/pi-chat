@@ -1,4 +1,4 @@
-export type ChatService = "telegram" | "discord" | "feishu";
+export type ChatService = "telegram" | "discord" | "feishu" | "weixin";
 
 export type TriggerMode = "mention" | "message";
 
@@ -76,7 +76,21 @@ export interface FeishuAccountConfig extends BaseAccountConfig {
 	botUsername?: string;
 }
 
-export type ChatAccountConfig = TelegramAccountConfig | DiscordAccountConfig | FeishuAccountConfig;
+export interface WeixinAccountConfig extends BaseAccountConfig {
+	service: "weixin";
+	/** iLink bot access token issued after scanning the WeChat QR code. */
+	botToken: string;
+	/** iLink bot identifier used to filter the bot's own echoed messages. */
+	botUserId: string;
+	/** WeChat user identifier returned by the QR login flow. */
+	userId?: string;
+}
+
+export type ChatAccountConfig =
+	| TelegramAccountConfig
+	| DiscordAccountConfig
+	| FeishuAccountConfig
+	| WeixinAccountConfig;
 
 export interface ChatConfig {
 	botName?: string;

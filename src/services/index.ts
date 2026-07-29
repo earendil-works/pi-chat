@@ -4,6 +4,7 @@ import type {
 	DiscordAccountConfig,
 	FeishuAccountConfig,
 	TelegramAccountConfig,
+	WeixinAccountConfig,
 } from "../core/config-types.js";
 import type { DiscoverySnapshot } from "../core/discovery-types.js";
 import { removeDiscoverySnapshot, saveDiscoverySnapshot } from "../discovery-store.js";
@@ -11,11 +12,13 @@ import { discordDiscoveryProvider } from "./discord.js";
 import { feishuDiscoveryProvider } from "./feishu.js";
 import { telegramDiscoveryProvider } from "./telegram.js";
 import type { AccountDraft, DiscoveryProvider } from "./types.js";
+import { weixinDiscoveryProvider } from "./weixin.js";
 
 const providers: Record<ChatService, DiscoveryProvider> = {
 	telegram: telegramDiscoveryProvider,
 	discord: discordDiscoveryProvider,
 	feishu: feishuDiscoveryProvider,
+	weixin: weixinDiscoveryProvider,
 };
 
 export async function validateAccountDraft(draft: AccountDraft) {
@@ -50,6 +53,14 @@ export function updateAccountIdentityFromSnapshot(
 			...account,
 			botUserId: snapshot.identity.id,
 			botUsername: snapshot.identity.userName,
+		};
+		if (!next.name) next.name = snapshot.identity.name;
+		return next;
+	}
+	if (account.service === "weixin") {
+		const next: WeixinAccountConfig = {
+			...account,
+			botUserId: snapshot.identity.id,
 		};
 		if (!next.name) next.name = snapshot.identity.name;
 		return next;
