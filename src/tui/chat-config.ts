@@ -2,9 +2,11 @@ import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 import {
 	CHAT_CONFIG_PATH,
+	defaultMountGuestPath,
 	loadChatConfig,
 	removeAccountStorage,
 	removeChannelStorage,
+	resolveGondolinMounts,
 	saveChatConfig,
 } from "../config.js";
 import type {
@@ -12,9 +14,12 @@ import type {
 	ChatAccountConfig,
 	ChatConfig,
 	DiscordAccountConfig,
+	FeishuAccountConfig,
 	GondolinConfig,
+	GondolinMountConfig,
 	GondolinSecretConfig,
 	TelegramAccountConfig,
+	WeixinAccountConfig,
 } from "../core/config-types.js";
 import type { DiscoveredChannel, DiscoveredRole, DiscoveredUser, DiscoverySnapshot } from "../core/discovery-types.js";
 import { makeChannelKey } from "../core/keys.js";
@@ -22,13 +27,16 @@ import { loadDiscoverySnapshot } from "../discovery-store.js";
 import { refreshAccountSnapshot, updateAccountIdentityFromSnapshot } from "../services/index.js";
 import { selectItem, showNotice, toggleItems } from "./dialogs.js";
 import { createDiscordAccountWithGuidedSetup } from "./discord-setup.js";
+import { addFeishuObservedTargetToAccount, createFeishuAccountWithGuidedSetup } from "./feishu-setup.js";
 import { addTelegramObservedTargetToAccount, createTelegramAccountWithGuidedSetup } from "./telegram-setup.js";
+import { addWeixinObservedTargetToAccount, createWeixinAccountWithGuidedSetup } from "./weixin-setup.js";
 
 function accountDescription(account: ChatAccountConfig, snapshot: DiscoverySnapshot | undefined): string {
 	const parts: string[] = [account.service];
 	if (account.name) parts.push(account.name);
 	if (account.service === "discord") parts.push(account.serverName);
-	else if (snapshot?.identity.userName) parts.push(`@${snapshot.identity.userName}`);
+	else if (snapshot?.identity.userName)
+		parts.push(account.service === "telegram" ? `@${snapshot.identity.userName}` : snapshot.identity.userName);
 	parts.push(
 		`${Object.keys(account.channels).length} configured channel${Object.keys(account.channels).length === 1 ? "" : "s"}`,
 	);
@@ -68,6 +76,20 @@ function defaultAccess(dm: boolean): AccessPolicy {
 function secretSummary(config: GondolinConfig | undefined): string {
 	const count = Object.keys(config?.secrets ?? {}).length;
 	return `${count} secret${count === 1 ? "" : "s"}`;
+}
+
+function mountSummary(config: GondolinConfig | undefined): string {
+	const count = (config?.mounts ?? []).length;
+	return `${count} mount${count === 1 ? "" : "s"}`;
+}
+
+function mountLabel(mount: GondolinMountConfig): string {
+	const guestPath = mount.guestPath?.trim() || defaultMountGuestPath(mount.hostPath);
+	return `${guestPath} ← ${mount.hostPath}`;
+}
+
+function isEmptyGondolinConfig(config: GondolinConfig): boolean {
+	return Object.keys(config.secrets ?? {}).length === 0 && (config.mounts ?? []).length === 0;
 }
 
 function isValidEnvVarName(value: string): boolean {
@@ -110,7 +132,7 @@ async function configureSecrets(
 	config: GondolinConfig | undefined,
 	onSave: (next: GondolinConfig | undefined) => Promise<void>,
 ): Promise<void> {
-	let current: GondolinConfig = { secrets: { ...(config?.secrets ?? {}) } };
+	let current: GondolinConfig = { ...config, secrets: { ...(config?.secrets ?? {}) } };
 	while (true) {
 		const secrets = current.secrets ?? {};
 		const choice = await selectItem(ctx, title, [
@@ -127,8 +149,10 @@ async function configureSecrets(
 		]);
 		if (!choice || choice === "__back__") return;
 		if (choice === "__save__") {
-			const next = Object.keys(current.secrets ?? {}).length > 0 ? current : undefined;
-			await onSave(next);
+			const base: GondolinConfig = { ...current };
+			delete base.secrets;
+			const next = Object.keys(secrets).length > 0 ? { ...base, secrets } : base;
+			await onSave(isEmptyGondolinConfig(next) ? undefined : next);
 			return;
 		}
 		if (choice === "__add__") {
@@ -157,6 +181,85 @@ async function configureSecrets(
 		if (draft.name !== choice) delete nextSecrets[choice];
 		nextSecrets[draft.name] = draft.secret;
 		current = { ...current, secrets: nextSecrets };
+	}
+}
+
+async function promptMountDraft(
+	ctx: ExtensionContext,
+	current?: GondolinMountConfig,
+): Promise<GondolinMountConfig | undefined> {
+	const hostPath = (await ctx.ui.input("Host directory to mount", current?.hostPath ?? "~/"))?.trim();
+	if (!hostPath) return undefined;
+	const guestPathInput = (
+		await ctx.ui.input(`Guest path (empty = ${defaultMountGuestPath(hostPath)})`, current?.guestPath ?? "")
+	)?.trim();
+	const mode = await selectItem(ctx, "Mount mode", [
+		{ value: "ro", label: "Read-only", description: "The agent can read files but cannot modify them" },
+		{
+			value: "rw",
+			label: "Read-write",
+			description: "The agent can create, modify, and delete files in the host directory",
+		},
+	]);
+	if (!mode) return undefined;
+	return { hostPath, guestPath: guestPathInput || undefined, readOnly: mode === "ro" };
+}
+
+async function configureMounts(
+	ctx: ExtensionContext,
+	title: string,
+	config: GondolinConfig | undefined,
+	onSave: (next: GondolinConfig | undefined) => Promise<void>,
+): Promise<void> {
+	let current: GondolinConfig = { ...config, mounts: [...(config?.mounts ?? [])] };
+	while (true) {
+		const mounts = current.mounts ?? [];
+		const choice = await selectItem(ctx, title, [
+			{ value: "__add__", label: "+ Add mount", description: "Expose a host directory inside the VM" },
+			...mounts.map((mount, index) => ({
+				value: String(index),
+				label: mountLabel(mount),
+				description: mount.readOnly ? "read-only" : "read-write",
+			})),
+			{ value: "__save__", label: "Save" },
+			{ value: "__back__", label: "Back" },
+		]);
+		if (!choice || choice === "__back__") return;
+		if (choice === "__save__") {
+			try {
+				resolveGondolinMounts(current);
+			} catch (error) {
+				await showNotice(ctx, "Invalid mounts", error instanceof Error ? error.message : String(error), "error");
+				continue;
+			}
+			const base: GondolinConfig = { ...current };
+			delete base.mounts;
+			const next = mounts.length > 0 ? { ...base, mounts } : base;
+			await onSave(isEmptyGondolinConfig(next) ? undefined : next);
+			return;
+		}
+		if (choice === "__add__") {
+			const draft = await promptMountDraft(ctx);
+			if (!draft) continue;
+			current = { ...current, mounts: [...mounts, draft] };
+			continue;
+		}
+		const index = Number(choice);
+		const existing = mounts[index];
+		if (!existing) continue;
+		const action = await selectItem(ctx, mountLabel(existing), [
+			{ value: "edit", label: "Edit" },
+			{ value: "delete", label: "Delete" },
+			{ value: "back", label: "Back" },
+		]);
+		if (!action || action === "back") continue;
+		if (action === "delete") {
+			current = { ...current, mounts: mounts.filter((_, itemIndex) => itemIndex !== index) };
+			continue;
+		}
+		const draft = await promptMountDraft(ctx, existing);
+		if (!draft) continue;
+		current = { ...current, mounts: mounts.map((mount, itemIndex) => (itemIndex === index ? draft : mount)) };
 	}
 }
 
@@ -265,6 +368,7 @@ async function configureConfiguredChannel(
 		const choice = await selectItem(ctx, `${accountId}/${channelKey}`, [
 			{ value: "access", label: "Edit access policy" },
 			{ value: "secrets", label: "Secrets", description: secretSummary(channel.gondolin) },
+			{ value: "mounts", label: "Mounts", description: mountSummary(channel.gondolin) },
 			{ value: "delete", label: "Delete channel", description: "Remove this configured channel" },
 			{ value: "back", label: "Back" },
 		]);
@@ -285,6 +389,14 @@ async function configureConfiguredChannel(
 		}
 		if (choice === "secrets") {
 			await configureSecrets(ctx, `${accountId}/${channelKey} secrets`, channel.gondolin, async (next) => {
+				channel.gondolin = next;
+				account.channels[channelKey] = channel;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
+		if (choice === "mounts") {
+			await configureMounts(ctx, `${accountId}/${channelKey} mounts`, channel.gondolin, async (next) => {
 				channel.gondolin = next;
 				account.channels[channelKey] = channel;
 				await saveChatConfig(config);
@@ -323,6 +435,7 @@ async function configureDiscordAccount(ctx: ExtensionContext, accountId: string)
 			});
 		const choice = await selectItem(ctx, `${accountId} (${account.serverName})`, [
 			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
+			{ value: "mounts", label: "Mounts", description: mountSummary(account.gondolin) },
 			{ value: "delete", label: "Delete account", description: "Remove account and all configured channels" },
 			{
 				value: "refresh",
@@ -335,6 +448,14 @@ async function configureDiscordAccount(ctx: ExtensionContext, accountId: string)
 		if (!choice || choice === "back") return;
 		if (choice === "secrets") {
 			await configureSecrets(ctx, `${accountId} secrets`, account.gondolin, async (next) => {
+				account.gondolin = next;
+				config.accounts[accountId] = account;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
+		if (choice === "mounts") {
+			await configureMounts(ctx, `${accountId} mounts`, account.gondolin, async (next) => {
 				account.gondolin = next;
 				config.accounts[accountId] = account;
 				await saveChatConfig(config);
@@ -376,6 +497,7 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 		}));
 		const choice = await selectItem(ctx, `${accountId} (@${account.botUsername ?? "bot"})`, [
 			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
+			{ value: "mounts", label: "Mounts", description: mountSummary(account.gondolin) },
 			{ value: "add-dm", label: "Add DM", description: "Pair a DM by sending /start to the bot" },
 			{ value: "add-group", label: "Add group", description: "Observe activity after adding the bot to a group" },
 			{ value: "refresh", label: "Refresh bot info" },
@@ -386,6 +508,14 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 		if (!choice || choice === "back") return;
 		if (choice === "secrets") {
 			await configureSecrets(ctx, `${accountId} secrets`, account.gondolin, async (next) => {
+				account.gondolin = next;
+				config.accounts[accountId] = account;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
+		if (choice === "mounts") {
+			await configureMounts(ctx, `${accountId} mounts`, account.gondolin, async (next) => {
 				account.gondolin = next;
 				config.accounts[accountId] = account;
 				await saveChatConfig(config);
@@ -419,12 +549,193 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 	}
 }
 
+async function configureFeishuAccount(ctx: ExtensionContext, accountId: string): Promise<void> {
+	while (true) {
+		const config = await loadChatConfig();
+		const account = config.accounts[accountId] as FeishuAccountConfig | undefined;
+		if (!account || account.service !== "feishu") return;
+		const snapshot = await loadDiscoverySnapshot(accountId);
+		const configuredIds = new Set(Object.values(account.channels).map((channel) => channel.id));
+		const discoveredChoices = (snapshot?.channels ?? [])
+			.map((channel) => ({
+				value: channel.id,
+				label: `${configuredIds.has(channel.id) ? "●" : "○"} ${channel.name}`,
+				description: configuredIds.has(channel.id) ? "configured" : channel.dm ? "dm" : "group",
+			}))
+			.sort((a, b) => a.label.localeCompare(b.label));
+		const configuredOnlyChoices = Object.entries(account.channels)
+			.filter(([, channel]) => !(snapshot?.channels ?? []).some((item) => item.id === channel.id))
+			.map(([key, channel]) => ({
+				value: `configured:${key}`,
+				label: `● ${channel.name ?? key}`,
+				description: channel.dm ? "configured dm" : "configured channel",
+			}));
+		const choice = await selectItem(ctx, `${accountId} (${account.botUsername ?? account.appId})`, [
+			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
+			{ value: "mounts", label: "Mounts", description: mountSummary(account.gondolin) },
+			{
+				value: "receive-mode",
+				label: `Receive mode: ${account.receiveMode ?? "auto"}`,
+				description: "Auto uses WebSocket for one channel and history polling for multiple channels",
+			},
+			{ value: "add-dm", label: "Add DM", description: "Observe a direct message sent to the bot" },
+			{ value: "add-group", label: "Observe group", description: "Pair a group not returned by discovery" },
+			{
+				value: "refresh",
+				label: "Refresh chats and members",
+				description: snapshot?.fetchedAt ? `Last fetched ${snapshot.fetchedAt}` : "No snapshot yet",
+			},
+			{ value: "delete", label: "Delete account", description: "Remove account and all configured channels" },
+			...configuredOnlyChoices,
+			...discoveredChoices,
+			{ value: "back", label: "Back" },
+		]);
+		if (!choice || choice === "back") return;
+		if (choice === "secrets") {
+			await configureSecrets(ctx, `${accountId} secrets`, account.gondolin, async (next) => {
+				account.gondolin = next;
+				config.accounts[accountId] = account;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
+		if (choice === "mounts") {
+			await configureMounts(ctx, `${accountId} mounts`, account.gondolin, async (next) => {
+				account.gondolin = next;
+				config.accounts[accountId] = account;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
+		if (choice === "receive-mode") {
+			const receiveMode = await selectItem(ctx, "Feishu receive mode", [
+				{
+					value: "auto",
+					label: "Auto",
+					description: "WebSocket for one configured channel; polling for multiple channel workers",
+				},
+				{
+					value: "websocket",
+					label: "WebSocket",
+					description: "Lowest latency; only one active client per Feishu application receives each event",
+				},
+				{
+					value: "polling",
+					label: "History polling",
+					description: "Works across multiple workers; requires permission to read chat history",
+				},
+			]);
+			if (!receiveMode) continue;
+			account.receiveMode = receiveMode as FeishuAccountConfig["receiveMode"];
+			config.accounts[accountId] = account;
+			await saveChatConfig(config);
+			continue;
+		}
+		if (choice === "add-dm" || choice === "add-group") {
+			await addFeishuObservedTargetToAccount(ctx, config, accountId, account, choice === "add-dm" ? "dm" : "group");
+			continue;
+		}
+		if (choice === "refresh") {
+			const fresh = await refreshAccountSnapshot(accountId, account);
+			config.accounts[accountId] = updateAccountIdentityFromSnapshot(account, fresh);
+			await saveChatConfig(config);
+			if ((fresh.warnings?.length ?? 0) > 0) {
+				await showNotice(ctx, "Refresh warnings", (fresh.warnings ?? []).join("\n"), "warning");
+			}
+			continue;
+		}
+		if (choice === "delete") {
+			const ok = await ctx.ui.confirm("Delete account", `Delete ${accountId} and all configured channels?`);
+			if (!ok) continue;
+			delete config.accounts[accountId];
+			await saveChatConfig(config);
+			await removeAccountStorage(accountId, ctx.cwd);
+			await showNotice(ctx, "Account deleted", `Deleted ${accountId}`, "info");
+			return;
+		}
+		if (choice.startsWith("configured:")) {
+			await configureConfiguredChannel(ctx, config, accountId, choice.slice("configured:".length));
+			continue;
+		}
+		const channel = snapshot?.channels.find((item) => item.id === choice);
+		if (channel) await configureDiscoveredChannel(ctx, config, accountId, channel, snapshot);
+	}
+}
+
+async function configureWeixinAccount(ctx: ExtensionContext, accountId: string): Promise<void> {
+	while (true) {
+		const config = await loadChatConfig();
+		const account = config.accounts[accountId] as WeixinAccountConfig | undefined;
+		if (!account || account.service !== "weixin") return;
+		const channelChoices = Object.entries(account.channels).map(([key, channel]) => ({
+			value: key,
+			label: key,
+			description: `${channel.name ?? channel.id} • direct message`,
+		}));
+		const choice = await selectItem(ctx, `${accountId} (${account.botUserId})`, [
+			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
+			{ value: "mounts", label: "Mounts", description: mountSummary(account.gondolin) },
+			{ value: "add-dm", label: "Add DM", description: "Pair a direct chat by observing a new message" },
+			{ value: "refresh", label: "Refresh account info" },
+			{
+				value: "delete",
+				label: "Delete account",
+				description: "Remove account and all configured direct-message channels",
+			},
+			...channelChoices,
+			{ value: "back", label: "Back" },
+		]);
+		if (!choice || choice === "back") return;
+		if (choice === "secrets") {
+			await configureSecrets(ctx, `${accountId} secrets`, account.gondolin, async (next) => {
+				account.gondolin = next;
+				config.accounts[accountId] = account;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
+		if (choice === "mounts") {
+			await configureMounts(ctx, `${accountId} mounts`, account.gondolin, async (next) => {
+				account.gondolin = next;
+				config.accounts[accountId] = account;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
+		if (choice === "add-dm") {
+			await addWeixinObservedTargetToAccount(ctx, config, accountId, account);
+			continue;
+		}
+		if (choice === "refresh") {
+			const fresh = await refreshAccountSnapshot(accountId, account);
+			config.accounts[accountId] = updateAccountIdentityFromSnapshot(account, fresh);
+			await saveChatConfig(config);
+			if ((fresh.warnings?.length ?? 0) > 0) {
+				await showNotice(ctx, "Refresh warnings", (fresh.warnings ?? []).join("\n"), "warning");
+			}
+			continue;
+		}
+		if (choice === "delete") {
+			const ok = await ctx.ui.confirm("Delete account", `Delete ${accountId} and all configured channels?`);
+			if (!ok) continue;
+			delete config.accounts[accountId];
+			await saveChatConfig(config);
+			await removeAccountStorage(accountId, ctx.cwd);
+			await showNotice(ctx, "Account deleted", `Deleted ${accountId}`, "info");
+			return;
+		}
+		await configureConfiguredChannel(ctx, config, accountId, choice);
+	}
+}
+
 async function configureAccount(ctx: ExtensionContext, accountId: string): Promise<void> {
 	const config = await loadChatConfig();
 	const account = config.accounts[accountId];
 	if (!account) return;
 	if (account.service === "discord") return configureDiscordAccount(ctx, accountId);
 	if (account.service === "telegram") return configureTelegramAccount(ctx, accountId);
+	if (account.service === "feishu") return configureFeishuAccount(ctx, accountId);
+	if (account.service === "weixin") return configureWeixinAccount(ctx, accountId);
 }
 
 export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
@@ -441,12 +752,17 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 		);
 		const choice = await selectItem(ctx, "pi-chat accounts", [
 			{ value: "__secrets__", label: "Secrets", description: secretSummary(config.gondolin) },
+			{ value: "__mounts__", label: "Mounts", description: mountSummary(config.gondolin) },
 			...snapshots.map(({ accountId, snapshot }) => ({
 				value: accountId,
 				label: accountId,
 				description: accountDescription(config.accounts[accountId], snapshot),
 			})),
-			{ value: "__create__", label: "+ Create account", description: "Create a Telegram or Discord account" },
+			{
+				value: "__create__",
+				label: "+ Create account",
+				description: "Create a Telegram, Discord, Feishu, or Weixin account",
+			},
 		]);
 		if (!choice) return;
 		if (choice === "__secrets__") {
@@ -456,14 +772,33 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 			});
 			continue;
 		}
+		if (choice === "__mounts__") {
+			await configureMounts(ctx, "pi-chat mounts", config.gondolin, async (next) => {
+				config.gondolin = next;
+				await saveChatConfig(config);
+			});
+			continue;
+		}
 		if (choice === "__create__") {
 			const serviceChoice = await selectItem(ctx, "Create account", [
 				{ value: "telegram", label: "Telegram" },
 				{ value: "discord", label: "Discord" },
+				{ value: "feishu", label: "Feishu" },
+				{ value: "weixin", label: "Weixin", description: "Personal WeChat direct messages via iLink QR login" },
 			]);
 			if (!serviceChoice) continue;
 			if (serviceChoice === "telegram") {
 				const accountId = await createTelegramAccountWithGuidedSetup(ctx, config);
+				if (accountId) await configureAccount(ctx, accountId);
+				continue;
+			}
+			if (serviceChoice === "feishu") {
+				const accountId = await createFeishuAccountWithGuidedSetup(ctx, config);
+				if (accountId) await configureAccount(ctx, accountId);
+				continue;
+			}
+			if (serviceChoice === "weixin") {
+				const accountId = await createWeixinAccountWithGuidedSetup(ctx, config);
 				if (accountId) await configureAccount(ctx, accountId);
 				continue;
 			}

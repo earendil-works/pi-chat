@@ -27,6 +27,7 @@ async function callTelegram<T>(botToken: string, method: string): Promise<T> {
 export const telegramDiscoveryProvider: DiscoveryProvider = {
 	service: "telegram",
 	async validate(draft: AccountDraft): Promise<AccountValidationResult> {
+		if (draft.service !== "telegram") throw new Error("Invalid Telegram account draft");
 		const user = await callTelegram<TelegramUser>(draft.botToken, "getMe");
 		const fullName = [user.first_name, user.last_name].filter(Boolean).join(" ") || user.username || String(user.id);
 		return {

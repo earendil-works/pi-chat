@@ -1,11 +1,11 @@
 # pi-chat
 
-Pi extension bridging Discord and Telegram to a sandboxed pi session via Gondolin micro-VMs.
+Pi extension bridging Discord, Telegram, and Feishu to a sandboxed pi session via Gondolin micro-VMs.
 
 ## Architecture
 
 ```
-Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ pi agent
+Discord/Telegram/Feishu ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ pi agent
                                         ↕
                                    Gondolin VM (Alpine + bash)
                                    /workspace  /shared
@@ -15,6 +15,7 @@ Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ p
 - **One JSONL log per channel.** Append-only event stream: inbound, outbound, job lifecycle.
 - **Trigger-based dispatch.** Mentions in channels, every message in DMs. Triggers queue jobs; jobs produce slices of inbound records for the agent.
 - **Tools run inside the VM.** `read`, `write`, `edit`, `bash` are routed through Gondolin. `chat_history` and `chat_attach` run on the host.
+- **Extra host mounts.** Users can expose additional host directories via `gondolin.mounts` (global/account/channel config, or the "Mounts" UI in `/chat-config`). Entries are `{ hostPath, guestPath?, readOnly? }`; guestPath defaults to `/mnt/<dir name>` and must not overlap `/workspace` or `/shared`. Mounts are merged by guest path (channel overrides account overrides global) in `resolveGondolinMounts()` and attached at VM start; read-only mounts are wrapped in gondolin's `ReadonlyProvider`. Mount changes require a sandbox restart (the `/chat-config` flow prompts for one).
 
 ## Entry point
 
@@ -44,9 +45,10 @@ Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ p
 
 ### Live adapters
 - `src/live/types.ts` — `LiveConnection` and `LiveConnectionHandlers` interfaces.
-- `src/live/index.ts` — Adapter router (Discord vs Telegram).
+- `src/live/index.ts` — Adapter router (Discord vs Telegram vs Feishu).
 - `src/live/discord.ts` — Discord adapter: discord.js gateway, catch-up pagination, REST message sending with chunking and formatting, reply-to, auto-reconnect on disconnect.
 - `src/live/telegram.ts` — Telegram adapter: long-polling, media group debounce, initial catch-up, chunked sending with Markdown formatting.
+- `src/live/feishu.ts` — Feishu adapter: official SDK WebSocket events or history polling, catch-up checkpoints, message/resource conversion, replies, uploads, and editing.
 - `src/live/common.ts` — Shared: attachment download/storage, MIME detection, bot mention detection.
 
 ### Rendering
@@ -59,6 +61,7 @@ Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ p
 - `src/services/index.ts` — Account snapshot refresh, identity update.
 - `src/services/discord.ts` — Discord bot validation, server listing, channel/role/user discovery.
 - `src/services/telegram.ts` — Telegram bot validation, identity fetch.
+- `src/services/feishu.ts` — Feishu application validation, bot identity, group and member discovery.
 - `src/services/types.ts` — Shared service types.
 
 ### TUI
@@ -66,6 +69,7 @@ Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ p
 - `src/tui/dialogs.ts` — Shared dialog helpers: select, notice, loader, toggle.
 - `src/tui/discord-setup.ts` — Guided Discord account setup (token, server selection, invite flow).
 - `src/tui/telegram-setup.ts` — Guided Telegram account setup (token, DM/group observation).
+- `src/tui/feishu-setup.ts` — Guided Feishu application setup and DM/group observation.
 
 ## Storage layout
 
@@ -103,7 +107,7 @@ Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ p
 
 ## Remote control commands
 
-Parsed by `ConversationRuntime.parseControlCommand()`: `stop`, `new`, `compact`, `status`. Handled before normal ingest in the `onMessage` path.
+Parsed by `ConversationRuntime.parseControlCommand()`: `stop`, `new`, `compact`, `status`, `model`. Handled before normal ingest in the `onMessage` path. `model` (no args) lists available models; `model <provider/id|name>` switches the active model via `pi.setModel()`.
 
 ## Secret exchange flow
 
