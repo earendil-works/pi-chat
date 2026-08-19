@@ -333,21 +333,48 @@ export async function connectTelegramLive(
 				const chunks = chunkText(rendered.text, maxMessageLength("telegram"));
 				let firstId: string | undefined;
 				for (let i = 0; i < chunks.length; i++) {
-					const id = String(
-						(
-							await callTelegram<{ message_id: number }>(
-								account.botToken,
-								"sendMessage",
-								{
-									chat_id: Number(conversation.channel.id),
-									text: chunks[i],
-									parse_mode: rendered.parseMode,
-									...(i === 0 ? replyParam : {}),
-								},
-								{ signal },
-							)
-						).message_id,
-					);
+					const params: Record<string, unknown> = {
+						chat_id: Number(conversation.channel.id),
+						text: chunks[i],
+						parse_mode: rendered.parseMode,
+						...(i === 0 ? replyParam : {}),
+					};
+					// chunkText() splits on paragraph boundaries and is not Markdown-aware, so a
+					// formattester like **bold** or `code` that spans a boundary can be split
+					// into an unclosed entity. Telegram rejects that chunk with a parse error;
+					// fall back to plain text (no parse_mode) so the message is still delivered.
+					let id: string | undefined;
+					try {
+						id = String(
+							(
+								await callTelegram<{ message_id: number }>(
+									account.botToken,
+									"sendMessage",
+									params,
+									{ signal },
+								)
+							).message_id,
+						);
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						if (/can't parse entities/i.test(message)) {
+							// Retry as plain text when the Telegram API fails to parse the
+							// (possibly unclosed) Markdown formatting.
+							const { parse_mode: _omit, ...plainParams } = params;
+							id = String(
+								(
+									await callTelegram<{ message_id: number }>(
+										account.botToken,
+									"sendMessage",
+									plainParams,
+									{ signal },
+								)
+								).message_id,
+							);
+						} else {
+							throw error;
+						}
+					}
 					firstId ??= id;
 				}
 				return firstId || "";
