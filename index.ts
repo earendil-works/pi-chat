@@ -1332,7 +1332,10 @@ export default function (pi: ExtensionAPI) {
 				return tool.execute(id, params, signal, onUpdate);
 			},
 		});
-		pi.setActiveTools([
+		// Preserve tools registered by other extensions (e.g. subagent) instead of
+		// replacing the entire active tool list with a hardcoded whitelist. Merge
+		// the chat tools with whatever is already active so nothing gets dropped.
+		const chatTools = [
 			"read",
 			"write",
 			"edit",
@@ -1341,7 +1344,9 @@ export default function (pi: ExtensionAPI) {
 			"chat_attach",
 			"chat_request_secret",
 			"chat_workers",
-		]);
+		];
+		const currentTools = pi.getActiveTools();
+		pi.setActiveTools([...new Set([...currentTools, ...chatTools])]);
 		updateStatus(ctx);
 		const flaggedConversationId = pi.getFlag(CHAT_CONVERSATION_FLAG);
 		const persistedConversationId = getPersistedConversationId(ctx);
